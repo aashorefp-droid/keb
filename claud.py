@@ -16,12 +16,394 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta, date
 import time
+import io
+import sqlite3
+import os
+import pytz
 
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
 except ImportError:
     YFINANCE_AVAILABLE = False
+
+# ──────────────────────────────────────────────
+# TRADE TRACKER DATABASE (SQLite)
+# ──────────────────────────────────────────────
+
+TRADE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockpulse_trades.db")
+
+
+def _get_trade_db():
+    """Get a connection to the trades database, creating tables if needed."""
+    conn = sqlite3.connect(TRADE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_loss REAL,
+            target1 REAL,
+            target2 REAL,
+            verdict TEXT,
+            confidence TEXT,
+            score INTEGER,
+            signals TEXT,
+            t1_trading_days INTEGER,
+            t2_trading_days INTEGER,
+            entry_date TEXT NOT NULL,
+            status TEXT DEFAULT 'OPEN',
+            exit_price REAL,
+            exit_date TEXT,
+            pnl_pct REAL,
+            outcome TEXT,
+            t1_hit INTEGER DEFAULT 0,
+            t2_hit INTEGER DEFAULT 0,
+            stop_hit INTEGER DEFAULT 0,
+            high_since_entry REAL,
+            low_since_entry REAL,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS holdings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            avg_cost REAL NOT NULL,
+            added_date TEXT DEFAULT (date('now')),
+            notes TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+# ── Holdings CRUD ──────────────────────────────────────
+def save_holding(ticker, quantity, avg_cost, notes=None):
+    conn = _get_trade_db()
+    try:
+        conn.execute("INSERT INTO holdings (ticker, quantity, avg_cost, notes) VALUES (?,?,?,?)",
+                     (ticker.upper().strip(), quantity, avg_cost, notes))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_holdings():
+    conn = _get_trade_db()
+    try:
+        rows = conn.execute("SELECT * FROM holdings ORDER BY ticker").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_holding(holding_id, quantity=None, avg_cost=None, notes=None):
+    conn = _get_trade_db()
+    try:
+        updates = {}
+        if quantity is not None:
+            updates["quantity"] = quantity
+        if avg_cost is not None:
+            updates["avg_cost"] = avg_cost
+        if notes is not None:
+            updates["notes"] = notes
+        if not updates:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values()) + [holding_id]
+        conn.execute(f"UPDATE holdings SET {set_clause} WHERE id = ?", vals)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_holding(holding_id):
+    conn = _get_trade_db()
+    try:
+        conn.execute("DELETE FROM holdings WHERE id=?", (holding_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_trade(ticker, direction, entry_price, stop_loss=None, target1=None,
+               target2=None, verdict=None, confidence=None, score=None,
+               signals=None, t1_days=None, t2_days=None, notes=None):
+    """Save a new trade to the database."""
+    conn = _get_trade_db()
+    try:
+        conn.execute("""
+            INSERT INTO trades (ticker, direction, entry_price, stop_loss, target1,
+                target2, verdict, confidence, score, signals, t1_trading_days,
+                t2_trading_days, entry_date, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, direction, entry_price, stop_loss, target1, target2,
+              verdict, confidence, score, signals, t1_days, t2_days,
+              str(date.today()), notes))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_open_trades():
+    """Get all open trades."""
+    conn = _get_trade_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status = 'OPEN' ORDER BY entry_date DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_all_trades():
+    """Get all trades (open and closed)."""
+    conn = _get_trade_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM trades ORDER BY entry_date DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_closed_trades():
+    """Get only closed trades."""
+    conn = _get_trade_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE status = 'CLOSED' ORDER BY exit_date DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_trade(trade_id, **kwargs):
+    """Update trade fields by id."""
+    conn = _get_trade_db()
+    try:
+        valid = {"status", "exit_price", "exit_date", "pnl_pct", "outcome",
+                 "t1_hit", "t2_hit", "stop_hit", "high_since_entry",
+                 "low_since_entry", "notes"}
+        updates = {k: v for k, v in kwargs.items() if k in valid}
+        if not updates:
+            return
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        vals = list(updates.values()) + [trade_id]
+        conn.execute(f"UPDATE trades SET {set_clause} WHERE id = ?", vals)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def close_trade(trade_id, exit_price, outcome=None, notes=None):
+    """Close a trade with exit price and calculate P&L."""
+    conn = _get_trade_db()
+    try:
+        row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        if not row:
+            return
+        trade = dict(row)
+        entry = trade["entry_price"]
+        direction = trade["direction"]
+        if direction == "LONG":
+            pnl_pct = round((exit_price - entry) / entry * 100, 2)
+        else:
+            pnl_pct = round((entry - exit_price) / entry * 100, 2)
+        if outcome is None:
+            outcome = "WIN" if pnl_pct > 0 else ("LOSS" if pnl_pct < 0 else "BREAKEVEN")
+        update_fields = {
+            "status": "CLOSED",
+            "exit_price": exit_price,
+            "exit_date": str(date.today()),
+            "pnl_pct": pnl_pct,
+            "outcome": outcome,
+        }
+        if notes:
+            update_fields["notes"] = notes
+        set_clause = ", ".join(f"{k} = ?" for k in update_fields)
+        vals = list(update_fields.values()) + [trade_id]
+        conn.execute(f"UPDATE trades SET {set_clause} WHERE id = ?", vals)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_trade(trade_id):
+    """Delete a trade by id."""
+    conn = _get_trade_db()
+    try:
+        conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def check_trade_targets(trade, current_price, high_since=None, low_since=None):
+    """
+    Check if a trade has hit its targets or stop loss.
+    Returns dict with updated fields.
+    """
+    entry = trade["entry_price"]
+    direction = trade["direction"]
+    t1 = trade.get("target1")
+    t2 = trade.get("target2")
+    stop = trade.get("stop_loss")
+
+    updates = {}
+
+    if direction == "LONG":
+        if high_since and t1 and high_since >= t1:
+            updates["t1_hit"] = 1
+        if high_since and t2 and high_since >= t2:
+            updates["t2_hit"] = 1
+        if low_since and stop and low_since <= stop:
+            updates["stop_hit"] = 1
+        if current_price and t1 and current_price >= t1:
+            updates["t1_hit"] = 1
+        if current_price and t2 and current_price >= t2:
+            updates["t2_hit"] = 1
+        if current_price and stop and current_price <= stop:
+            updates["stop_hit"] = 1
+    else:  # SHORT
+        if low_since and t1 and low_since <= t1:
+            updates["t1_hit"] = 1
+        if low_since and t2 and low_since <= t2:
+            updates["t2_hit"] = 1
+        if high_since and stop and high_since >= stop:
+            updates["stop_hit"] = 1
+        if current_price and t1 and current_price <= t1:
+            updates["t1_hit"] = 1
+        if current_price and t2 and current_price <= t2:
+            updates["t2_hit"] = 1
+        if current_price and stop and current_price >= stop:
+            updates["stop_hit"] = 1
+
+    if high_since:
+        updates["high_since_entry"] = high_since
+    if low_since:
+        updates["low_since_entry"] = low_since
+
+    return updates
+
+
+# ──────────────────────────────────────────────
+# TIMEZONE & INTRADAY TRACKING UTILITIES
+# ──────────────────────────────────────────────
+
+def get_cst_now():
+    """Get current time in CST (Central Standard Time)."""
+    utc_now = datetime.now(pytz.UTC)
+    cst = pytz.timezone('US/Central')
+    return utc_now.astimezone(cst)
+
+
+def is_after_market_time(hour_cst, minute_cst=0):
+    """Check if current time (CST) is at or after a specific market time."""
+    now_cst = get_cst_now()
+    market_time = now_cst.replace(hour=hour_cst, minute=minute_cst, second=0, microsecond=0)
+    return now_cst >= market_time
+
+
+def get_multiframe_bias_eval(ticker, entry_price, direction):
+    """
+    Evaluate bias using adaptive timeframes:
+      - Market hours (weekday 8:30-15:00 CST): 10-min / 30-min
+      - After hours (weekday 15:00+):           4-hour / 1-day
+      - Weekends (Sat/Sun):                     1-day  / 5-day (last Friday data)
+    Returns dict with bias info, alignment, conclusion, current_price.
+    """
+    try:
+        import yfinance as yf
+
+        now_cst = get_cst_now()
+        weekday = now_cst.weekday()  # 0=Mon .. 6=Sun
+        hour = now_cst.hour
+
+        # Determine which timeframe pair to use
+        is_weekend = weekday >= 5
+        is_market_hours = (not is_weekend) and (8 <= hour < 15)
+
+        if is_weekend:
+            # Weekend: 1-day / 5-day (covers last Friday)
+            tf_short_interval, tf_short_period = "1d", "5d"
+            tf_long_interval,  tf_long_period  = "1d", "1mo"
+            tf_short_label, tf_long_label = "1D", "5D"
+            short_bars, long_bars = 1, 5
+        elif is_market_hours:
+            # Market hours: 10-min / 30-min
+            tf_short_interval, tf_short_period = "10m", "5d"
+            tf_long_interval,  tf_long_period  = "30m", "5d"
+            tf_short_label, tf_long_label = "10m", "30m"
+            short_bars, long_bars = 3, 3
+        else:
+            # After hours weekday: 4-hour / 1-day
+            tf_short_interval, tf_short_period = "1h", "5d"
+            tf_long_interval,  tf_long_period  = "1d", "1mo"
+            tf_short_label, tf_long_label = "4H", "1D"
+            short_bars, long_bars = 4, 1
+
+        tk = yf.Ticker(ticker)
+        hist_short = tk.history(period=tf_short_period, interval=tf_short_interval)
+        hist_long  = tk.history(period=tf_long_period,  interval=tf_long_interval)
+
+        if hist_short.empty or hist_long.empty:
+            return None
+
+        current_price = float(hist_short["Close"].iloc[-1])
+
+        def eval_simple_bias(df, entry, n_bars):
+            """Bias: are recent n closes above/below entry?"""
+            closes = df["Close"].tail(n_bars).values
+            avg_close = float(np.mean(closes))
+            vol = df["Volume"].tail(n_bars).values
+            avg_vol = float(np.mean(vol))
+
+            if direction == "LONG":
+                bias = "BULLISH" if avg_close > entry else "BEARISH"
+            else:
+                bias = "BEARISH" if avg_close < entry else "BULLISH"
+
+            vol_bias = avg_vol / closes[0] if closes[0] > 0 else 0
+            return bias, vol_bias, avg_close
+
+        bias_short, vol_bias_short, _ = eval_simple_bias(hist_short, entry_price, short_bars)
+        bias_long,  vol_bias_long,  _ = eval_simple_bias(hist_long,  entry_price, long_bars)
+
+        alignment = "CONFIRMED" if bias_short == bias_long else "DIVERGED"
+
+        if alignment == "CONFIRMED":
+            conclusion = f"✅ BIAS CONFIRMED: Both {tf_short_label} & {tf_long_label} show {bias_short}"
+            color = "#00e5a0"
+        else:
+            conclusion = f"⚠️ BIAS DIVERGED: {tf_short_label}={bias_short}, {tf_long_label}={bias_long}"
+            color = "#f5c842"
+
+        return {
+            "bias_10min": bias_short,         # kept key name for compat
+            "vol_bias_10min": round(vol_bias_short, 4),
+            "bias_30min": bias_long,
+            "vol_bias_30min": round(vol_bias_long, 4),
+            "tf_short": tf_short_label,
+            "tf_long": tf_long_label,
+            "alignment": alignment,
+            "conclusion": conclusion,
+            "color": color,
+            "current_price": round(current_price, 2)
+        }
+    except Exception as e:
+        return None
+
 
 # ──────────────────────────────────────────────
 # POLYGON API HELPERS
@@ -214,6 +596,33 @@ def get_hourly_bars_alpaca(ticker, start_date, end_date, api_key, api_secret):
     return df
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_hourly_bars_yfinance(ticker, start_date, end_date):
+    """Hourly bars from Yahoo Finance (consolidated data, matches TOS). Free, no key needed."""
+    if not YFINANCE_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        tk = yf.Ticker(ticker)
+        # yfinance needs datetime objects; add buffer day on end
+        s = pd.to_datetime(start_date)
+        e = pd.to_datetime(end_date) + timedelta(days=1)
+        df = tk.history(start=s, end=e, interval="1h", auto_adjust=True)
+        if df.empty:
+            return pd.DataFrame()
+        # Ensure timezone is ET
+        if df.index.tz is None:
+            from zoneinfo import ZoneInfo
+            df.index = df.index.tz_localize("America/New_York")
+        else:
+            df.index = df.index.tz_convert("America/New_York")
+        df.columns = [c.lower() for c in df.columns]
+        # Keep only standard columns
+        cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        return df[cols]
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=300, show_spinner=False)  # 5 min cache for fresher options data
 def get_options_bias_alpaca(ticker, api_key, api_secret):
     """
@@ -370,7 +779,6 @@ def get_options_bias_alpaca(ticker, api_key, api_secret):
         return {"error": str(e)[:100], "debug": debug_info if 'debug_info' in dir() else []}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def _safe_int(val):
     """Convert a value to int, treating NaN/None as 0."""
     if val is None:
@@ -1044,12 +1452,52 @@ def estimate_next_earnings(events):
 
 
 # ──────────────────────────────────────────────
+# FINNHUB EARNINGS CALENDAR
+# ──────────────────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_earnings_calendar_finnhub(finnhub_key, from_date, to_date):
+    """
+    Fetch tickers reporting earnings between from_date and to_date
+    via Finnhub /calendar/earnings endpoint.
+    Returns list of dicts: [{symbol, date, hour(bmo/amc), epsEstimate, ...}]
+    """
+    url = "https://finnhub.io/api/v1/calendar/earnings"
+    params = {
+        "from": str(from_date),
+        "to": str(to_date),
+        "token": finnhub_key,
+    }
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    events = data.get("earningsCalendar", [])
+    # Filter to US-style tickers only (no dots like BRK.A except known ones)
+    results = []
+    for e in events:
+        sym = e.get("symbol", "")
+        if sym and "." not in sym and len(sym) <= 5:
+            results.append({
+                "symbol": sym,
+                "date": e.get("date", ""),
+                "hour": e.get("hour", ""),  # bmo / amc / dmh
+                "epsEstimate": e.get("epsEstimate"),
+                "revenueEstimate": e.get("revenueEstimate"),
+            })
+    results.sort(key=lambda x: (x["date"], x["symbol"]))
+    return results
+
+
+# ──────────────────────────────────────────────
 # 4H CANDLE
 # ──────────────────────────────────────────────
 
 def get_4h_noon_candle(ticker, report_date, hourly_df):
     """
-    Build the 9:30 AM – 1:30 PM ET 4H candle for a given date.
+    Build the 9:00 AM – 1:00 PM ET 4H candle for a given date.
+    (Standard first 4H candle: 8:00 AM – 12:00 PM CST)
+    Hourly bars are timestamped at start of each hour, so bars
+    at 9:00, 10:00, 11:00, 12:00 ET cover 9 AM – 1 PM ET.
     Returns dict with open, close, high, low or None.
     """
     if hourly_df is None or hourly_df.empty:
@@ -1067,14 +1515,9 @@ def get_4h_noon_candle(ticker, report_date, hourly_df):
         if day_bars.empty:
             return None
             
-        # Keep hours 9-13 ET (9:30–1:30 window)
+        # Keep bars at hours 9, 10, 11, 12 ET (covering 9 AM – 1 PM ET)
         window = day_bars[
-            (day_bars.index.hour >= 9) & (day_bars.index.hour < 14)
-        ]
-        # More precisely: exclude before 9:30 and after 13:30
-        window = window[
-            ~((window.index.hour == 9) & (window.index.minute < 30)) &
-            ~((window.index.hour == 13) & (window.index.minute >= 30))
+            (day_bars.index.hour >= 9) & (day_bars.index.hour <= 12)
         ]
         if window.empty:
             return None
@@ -1084,6 +1527,8 @@ def get_4h_noon_candle(ticker, report_date, hourly_df):
             "high":  float(window["high"].max()),
             "low":   float(window["low"].min()),
             "bars":  len(window),
+            "first_bar_ts": window.index[0],
+            "last_bar_ts": window.index[-1],
         }
     except Exception as e:
         return None
@@ -1243,6 +1688,136 @@ def calc_support_resistance(daily_df, n_levels=5):
         "supports": support_levels[:n_levels],
         "resistances": resistance_levels[:n_levels],
         "key_level": key_level,
+    }
+
+
+# ──────────────────────────────────────────────
+# VOLUME PROFILE ANALYSIS
+# ──────────────────────────────────────────────
+
+def analyze_volume_profile(daily_df, lookback=50, n_bins=50):
+    """
+    Build a volume profile over the last `lookback` days.
+    Returns dict with:
+      - poc       : Point of Control price (highest-volume price level)
+      - vah       : Value Area High (upper boundary of 70% volume zone)
+      - val       : Value Area Low  (lower boundary of 70% volume zone)
+      - vol_bias  : BULLISH / BEARISH / NEUTRAL
+      - vol_trend : ACCUMULATING / DISTRIBUTING / FLAT
+      - vol_ratio : current volume vs 20-day avg ratio
+      - vol_surge : True if today's volume > 1.5x avg
+      - detail    : human-readable summary string
+    """
+    if daily_df is None or len(daily_df) < 20:
+        return None
+
+    df = daily_df.tail(lookback).copy()
+    if df.empty or "volume" not in df.columns:
+        return None
+
+    current_price = float(df["close"].iloc[-1])
+    price_min = float(df["low"].min())
+    price_max = float(df["high"].max())
+    if price_max <= price_min:
+        return None
+
+    # Build volume-at-price histogram
+    bin_size = (price_max - price_min) / n_bins
+    vol_at_price = np.zeros(n_bins)
+
+    # Vectorized volume-at-price accumulation (replaces slow Python double loop)
+    lows   = df["low"].values.astype(float)
+    highs  = df["high"].values.astype(float)
+    vols   = df["volume"].values.astype(float)
+    valid  = (highs > lows) & (vols > 0)
+    lo_bins = np.clip(((lows[valid]  - price_min) / bin_size).astype(int), 0, n_bins - 1)
+    hi_bins = np.clip(((highs[valid] - price_min) / bin_size).astype(int), 0, n_bins - 1)
+    valid_vols = vols[valid]
+    for lo_b, hi_b, v in zip(lo_bins, hi_bins, valid_vols):
+        n_covered = hi_b - lo_b + 1
+        np.add.at(vol_at_price, range(lo_b, hi_b + 1), v / n_covered)
+
+    # Point of Control = bin with most volume
+    poc_bin = int(np.argmax(vol_at_price))
+    poc = price_min + (poc_bin + 0.5) * bin_size
+
+    # Value Area (70% of total volume centered on POC)
+    total_vol = vol_at_price.sum()
+    if total_vol == 0:
+        return None
+    target_vol = total_vol * 0.70
+    va_vol = vol_at_price[poc_bin]
+    lo_idx = poc_bin
+    hi_idx = poc_bin
+    while va_vol < target_vol and (lo_idx > 0 or hi_idx < n_bins - 1):
+        add_lo = vol_at_price[lo_idx - 1] if lo_idx > 0 else 0
+        add_hi = vol_at_price[hi_idx + 1] if hi_idx < n_bins - 1 else 0
+        if add_lo >= add_hi and lo_idx > 0:
+            lo_idx -= 1
+            va_vol += add_lo
+        elif hi_idx < n_bins - 1:
+            hi_idx += 1
+            va_vol += add_hi
+        else:
+            lo_idx -= 1
+            va_vol += add_lo
+    val = price_min + lo_idx * bin_size
+    vah = price_min + (hi_idx + 1) * bin_size
+
+    # Volume trend: compare last 5 avg vs prior 15 avg
+    recent_vol = df["volume"].iloc[-5:].mean() if len(df) >= 5 else df["volume"].mean()
+    prior_vol = df["volume"].iloc[-20:-5].mean() if len(df) >= 20 else df["volume"].mean()
+    vol_ratio_trend = recent_vol / prior_vol if prior_vol > 0 else 1.0
+
+    # Volume vs 20-day average
+    avg_vol_20 = df["volume"].iloc[-20:].mean() if len(df) >= 20 else df["volume"].mean()
+    today_vol = float(df["volume"].iloc[-1])
+    vol_ratio = today_vol / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    vol_surge = vol_ratio > 1.5
+
+    # Determine volume trend
+    if vol_ratio_trend > 1.2:
+        vol_trend = "ACCUMULATING"
+    elif vol_ratio_trend < 0.8:
+        vol_trend = "DISTRIBUTING"
+    else:
+        vol_trend = "FLAT"
+
+    # Volume bias based on price position relative to POC and Value Area
+    if current_price > vah:
+        # Above value area — if volume is rising, bullish breakout; else fading
+        vol_bias = "BULLISH" if vol_trend == "ACCUMULATING" else "NEUTRAL"
+    elif current_price < val:
+        # Below value area — if volume is rising, bearish breakdown; else fading
+        vol_bias = "BEARISH" if vol_trend == "ACCUMULATING" else "NEUTRAL"
+    elif current_price > poc:
+        # Inside value area, above POC — lean bullish
+        vol_bias = "BULLISH" if vol_trend != "DISTRIBUTING" else "NEUTRAL"
+    elif current_price < poc:
+        # Inside value area, below POC — lean bearish
+        vol_bias = "BEARISH" if vol_trend != "DISTRIBUTING" else "NEUTRAL"
+    else:
+        vol_bias = "NEUTRAL"
+
+    # Build detail string
+    pos_label = (
+        "Above VA" if current_price > vah else
+        "Below VA" if current_price < val else
+        "Above POC" if current_price > poc else
+        "Below POC" if current_price < poc else
+        "At POC"
+    )
+    detail = f"{pos_label} | POC ${poc:.2f} | VA ${val:.2f}-${vah:.2f} | {vol_trend} | Vol {vol_ratio:.1f}x"
+
+    return {
+        "poc": round(poc, 2),
+        "vah": round(vah, 2),
+        "val": round(val, 2),
+        "vol_bias": vol_bias,
+        "vol_trend": vol_trend,
+        "vol_ratio": round(vol_ratio, 2),
+        "vol_surge": vol_surge,
+        "detail": detail,
     }
 
 
@@ -1744,6 +2319,265 @@ def get_fundamentals(ticker):
 
 
 # ──────────────────────────────────────────────
+# MACRO MARKET INDICATORS
+# ──────────────────────────────────────────────
+
+MACRO_INSTRUMENTS = [
+    # (ticker, label, emoji, category)
+    ("SPY",   "S&P 500",   "📈", "index"),
+    ("QQQ",   "Nasdaq",    "💻", "index"),
+    ("DIA",   "Dow Jones", "🏛️", "index"),
+    ("IWM",   "Russell 2K","🏘️", "index"),
+    ("^VIX",  "VIX",       "🌡️", "fear"),
+    ("GLD",   "Gold",      "🥇", "commodity"),
+    ("SLV",   "Silver",    "🥈", "commodity"),
+    ("USO",   "Oil",       "⛽", "commodity"),
+    ("TLT",   "Bonds 20Y", "🏦", "bonds"),
+    ("DXY",   "USD Index", "💵", "currency"),
+    ("BTC-USD","Bitcoin",  "₿",  "crypto"),
+]
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_macro_snapshot():
+    """
+    Fetch current price, 1d change, 5d change, and 20d change for macro instruments.
+    Uses yfinance (free, no key needed). Returns list of dicts.
+    """
+    if not YFINANCE_AVAILABLE:
+        return []
+    import yfinance as yf
+    results = []
+    tickers = [t for t, *_ in MACRO_INSTRUMENTS]
+    try:
+        data = yf.download(tickers, period="30d", interval="1d",
+                           auto_adjust=True, progress=False, threads=True)
+        close = data["Close"] if "Close" in data.columns else data
+    except Exception:
+        return []
+
+    for ticker, label, emoji, category in MACRO_INSTRUMENTS:
+        try:
+            if ticker not in close.columns:
+                continue
+            s = close[ticker].dropna()
+            if len(s) < 2:
+                continue
+            price      = float(s.iloc[-1])
+            chg_1d     = (price - float(s.iloc[-2])) / float(s.iloc[-2]) * 100 if len(s) >= 2 else 0
+            chg_5d     = (price - float(s.iloc[-6])) / float(s.iloc[-6]) * 100 if len(s) >= 6 else chg_1d
+            chg_20d    = (price - float(s.iloc[-21])) / float(s.iloc[-21]) * 100 if len(s) >= 21 else chg_5d
+            results.append({
+                "ticker":   ticker,
+                "label":    label,
+                "emoji":    emoji,
+                "category": category,
+                "price":    round(price, 2),
+                "chg_1d":   round(chg_1d, 2),
+                "chg_5d":   round(chg_5d, 2),
+                "chg_20d":  round(chg_20d, 2),
+            })
+        except Exception:
+            continue
+    return results
+
+
+def _macro_card_html(item):
+    """Render a single macro instrument as an HTML card."""
+    chg = item["chg_1d"]
+    color = "#00e5a0" if chg > 0 else ("#ff4d6a" if chg < 0 else "#6b7099")
+    sign  = "+" if chg > 0 else ""
+    chg5_color = "#00e5a0" if item["chg_5d"] > 0 else ("#ff4d6a" if item["chg_5d"] < 0 else "#6b7099")
+    chg5_sign  = "+" if item["chg_5d"] > 0 else ""
+    chg20_color= "#00e5a0" if item["chg_20d"]>0 else ("#ff4d6a" if item["chg_20d"]<0 else "#6b7099")
+    chg20_sign = "+" if item["chg_20d"] > 0 else ""
+
+    # Special: VIX is inverse — high VIX = fear = bearish for market
+    if item["ticker"] == "^VIX":
+        risk = "🔴 Fear" if item["price"] > 25 else ("🟡 Caution" if item["price"] > 18 else "🟢 Calm")
+        sub_line = f'<div style="font-size:9px;color:#f0c040;margin-top:2px">{risk}</div>'
+    else:
+        sub_line = f'<div style="font-size:9px;color:#6b7099;margin-top:2px">5d <span style="color:{chg5_color}">{chg5_sign}{item["chg_5d"]:.1f}%</span> · 20d <span style="color:{chg20_color}">{chg20_sign}{item["chg_20d"]:.1f}%</span></div>'
+
+    return (
+        f'<div style="background:#0d0f17;border:1px solid #1a1d2e;padding:10px 12px;'
+        f'border-radius:6px;min-width:110px">'
+        f'<div style="font-size:10px;color:#6b7099">{item["emoji"]} {item["label"]}</div>'
+        f'<div style="font-size:15px;font-weight:700;color:#e8ecff;margin-top:2px">${item["price"]:,.2f}</div>'
+        f'<div style="font-size:11px;font-weight:600;color:{color}">{sign}{chg:.2f}%</div>'
+        f'{sub_line}'
+        f'</div>'
+    )
+
+
+def _render_sector_bar_chart(sector_list, score_key, label_key, detail_fn):
+    """Render a horizontal bar chart for sector strength. Works with both scan and ETF data."""
+    if not sector_list:
+        return
+    max_abs = max(abs(s[score_key]) for s in sector_list) or 1
+    bar_html = ""
+    for s in sector_list:
+        sc   = s[score_key]
+        pct  = abs(sc) / max_abs * 100
+        col  = "#00e5a0" if sc > 0 else ("#ff4d6a" if sc < 0 else "#6b7099")
+        icon = "▲" if sc > 0 else ("▼" if sc < 0 else "—")
+        bar_html += (
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">'
+            f'<div style="width:140px;font-size:11px;color:#e8ecff;text-align:right;flex-shrink:0;overflow:hidden;white-space:nowrap">'
+            f'<span style="color:{col}">{icon}</span> {str(s[label_key])[:18]}</div>'
+            f'<div style="flex:1;background:#1a1d2e;border-radius:3px;height:14px;overflow:hidden">'
+            f'<div style="width:{pct:.0f}%;background:{col};height:100%;border-radius:3px"></div></div>'
+            f'<div style="width:90px;font-size:10px;color:{col};flex-shrink:0">{detail_fn(s)}</div>'
+            f'</div>'
+        )
+    st.markdown(f'<div style="padding:4px 0 8px">{bar_html}</div>', unsafe_allow_html=True)
+
+
+def _render_macro_dashboard(macro_data, sector_str=None, etf_sector_perf=None):
+    """Render the full macro dashboard with risk assessment and sector strength."""
+    if not macro_data:
+        st.caption("Macro data unavailable — install yfinance to enable.")
+        return
+
+    # Split into categories
+    indices   = [m for m in macro_data if m["category"] == "index"]
+    fear      = [m for m in macro_data if m["category"] == "fear"]
+    comms     = [m for m in macro_data if m["category"] == "commodity"]
+    bonds     = [m for m in macro_data if m["category"] == "bonds"]
+    other     = [m for m in macro_data if m["category"] in ("currency", "crypto")]
+
+    # ── Market risk score ──────────────────────────────────────────────────
+    risk_score = 0
+    risk_notes = []
+    spx = next((m for m in macro_data if m["ticker"] == "SPY"), None)
+    vix = next((m for m in macro_data if m["ticker"] == "^VIX"), None)
+    tlt = next((m for m in macro_data if m["ticker"] == "TLT"), None)
+    gld = next((m for m in macro_data if m["ticker"] == "GLD"), None)
+
+    if vix:
+        if vix["price"] > 25:   risk_score += 2; risk_notes.append(f"VIX {vix['price']:.0f} — elevated fear")
+        elif vix["price"] > 18: risk_score += 1; risk_notes.append(f"VIX {vix['price']:.0f} — mild caution")
+        else:                   risk_notes.append(f"VIX {vix['price']:.0f} — calm")
+    if spx and spx["chg_5d"] < -2:
+        risk_score += 1; risk_notes.append(f"SPY 5d: {spx['chg_5d']:+.1f}% — market under pressure")
+    if tlt and tlt["chg_5d"] > 1:
+        risk_score += 1; risk_notes.append("Bonds rallying — flight to safety")
+    if gld and gld["chg_5d"] > 2:
+        risk_score += 1; risk_notes.append(f"Gold 5d: {gld['chg_5d']:+.1f}% — safe haven demand")
+
+    risk_label = "🟢 LOW RISK"       if risk_score == 0 else \
+                 "🟡 MODERATE RISK"  if risk_score <= 2 else \
+                 "🔴 HIGH RISK"
+    risk_color = "#00e5a0" if risk_score == 0 else ("#f0c040" if risk_score <= 2 else "#ff4d6a")
+
+    st.markdown(
+        f'<div style="background:#0d0f17;border:1px solid #1a1d2e;padding:10px 14px;'
+        f'border-radius:6px;margin-bottom:10px;display:flex;align-items:center;gap:16px">'
+        f'<div><div style="font-size:11px;color:#6b7099">MARKET RISK</div>'
+        f'<div style="font-size:14px;font-weight:700;color:{risk_color}">{risk_label}</div></div>'
+        f'<div style="font-size:10px;color:#6b7099;line-height:1.7">'
+        + " &nbsp;·&nbsp; ".join(risk_notes) +
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Cards grid ─────────────────────────────────────────────────────────
+    for group_label, group in [
+        ("Indices", indices), ("Fear / Vol", fear),
+        ("Commodities", comms), ("Bonds & Currency", bonds + other)
+    ]:
+        if not group:
+            continue
+        st.markdown(f'<div style="font-size:10px;color:#6b7099;font-weight:600;margin:8px 0 4px;letter-spacing:.05em">{group_label.upper()}</div>', unsafe_allow_html=True)
+        cols_html = "".join(_macro_card_html(m) for m in group)
+        st.markdown(
+            f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px">{cols_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Sector Strength ────────────────────────────────────────────────────
+    st.markdown('<hr style="border:none;border-top:1px solid #1a1d2e;margin:16px 0 12px">', unsafe_allow_html=True)
+
+    # Use scan-derived strength if available, otherwise fall back to ETF momentum
+    if sector_str:
+        st.markdown('<div style="font-size:10px;color:#6b7099;font-weight:600;letter-spacing:.06em;margin-bottom:8px">SECTOR STRENGTH — FROM LAST SCAN</div>', unsafe_allow_html=True)
+        _render_sector_bar_chart(sector_str, score_key="avg_score", label_key="sector",
+                                 detail_fn=lambda s: f'avg {s["avg_score"]:+.2f} · {s["total"]}T')
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Strongest**")
+            for s in sector_str[:3]:
+                st.markdown(f"🟢 **{s['sector']}** — {s['avg_score']:+.2f}, {s['bull_pct']:.0f}% bullish")
+        with col2:
+            st.markdown("**Weakest**")
+            for s in reversed(sector_str[-3:]):
+                st.markdown(f"🔴 **{s['sector']}** — {s['avg_score']:+.2f}, {s['bearish']}/{s['total']} bearish")
+
+    elif etf_sector_perf:
+        st.markdown('<div style="font-size:10px;color:#6b7099;font-weight:600;letter-spacing:.06em;margin-bottom:8px">SECTOR STRENGTH — ETF MOMENTUM (run Stock Analysis for signal-based view)</div>', unsafe_allow_html=True)
+        _render_sector_bar_chart(etf_sector_perf, score_key="momentum", label_key="name",
+                                 detail_fn=lambda s: f'1d {s["change_1d"]:+.1f}% · 1w {s["change_1w"]:+.1f}%')
+        hot   = [s for s in etf_sector_perf if s["momentum"] > 0][:3]
+        cold  = [s for s in reversed(etf_sector_perf) if s["momentum"] <= 0][:3]
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Strongest**")
+            for s in hot:
+                st.markdown(f"🟢 **{s['name']}** ({s['etf']}) — {s['momentum']:+.2f} momentum")
+        with col2:
+            st.markdown("**Weakest**")
+            for s in cold:
+                st.markdown(f"🔴 **{s['name']}** ({s['etf']}) — {s['momentum']:+.2f} momentum")
+    else:
+        st.caption("Run Stock Analysis to see signal-based sector strength, or wait for ETF data to load.")
+
+
+def _sector_strength_from_scan(scan_results):
+    """
+    Derive sector strength rankings from scan results.
+    Returns list of dicts sorted by strength score descending.
+    """
+    from collections import defaultdict
+    sector_data = defaultdict(lambda: {"bullish":0,"bearish":0,"total":0,"score_sum":0,"tickers":[]})
+
+    for r in scan_results:
+        sec = r.get("sector", "N/A") or "N/A"
+        if sec == "N/A":
+            continue
+        s = sector_data[sec]
+        s["total"] += 1
+        s["tickers"].append(r["ticker"])
+        score = r.get("score", 0) or 0
+        s["score_sum"] += score
+        verdict = r.get("verdict", "")
+        if "BULLISH" in verdict: s["bullish"] += 1
+        elif "BEARISH" in verdict: s["bearish"] += 1
+
+    result = []
+    for sec, d in sector_data.items():
+        if d["total"] == 0:
+            continue
+        bull_pct   = d["bullish"] / d["total"] * 100
+        bear_pct   = d["bearish"] / d["total"] * 100
+        avg_score  = d["score_sum"] / d["total"]
+        # Strength: weighted combo of avg score and bull/bear ratio
+        strength   = avg_score + (bull_pct - bear_pct) / 20
+        bias       = "BULLISH" if avg_score > 0.5 else ("BEARISH" if avg_score < -0.5 else "NEUTRAL")
+        result.append({
+            "sector":    sec,
+            "total":     d["total"],
+            "bullish":   d["bullish"],
+            "bearish":   d["bearish"],
+            "bull_pct":  round(bull_pct, 0),
+            "avg_score": round(avg_score, 2),
+            "strength":  round(strength, 2),
+            "bias":      bias,
+            "tickers":   ", ".join(d["tickers"][:6]),
+        })
+    result.sort(key=lambda x: x["strength"], reverse=True)
+    return result
+
+
+# ──────────────────────────────────────────────
 # SECTOR ANALYSIS
 # ──────────────────────────────────────────────
 
@@ -1832,14 +2666,395 @@ def get_sector_performance(api_key, api_secret, data_source):
 # STOCK SCANNER
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+# SHARED SCORING ENGINE
+# ──────────────────────────────────────────────
+
+def _compute_verdict_confidence_score(signals, signal_names, primary_candle_bias, vol_profile):
+    """
+    Single source of truth for verdict, confidence, and score.
+    Improvements vs original:
+      - Score threshold raised: BULLISH requires >= 3, BEARISH requires <= -3
+      - Vol trend DISTRIBUTING penalises by -1 (warns of exhaustion on borderline trades)
+      - ACCUMULATING does NOT add bonus — it promoted 25% win-rate LEAN trades to BULLISH
+      - Confidence incorporates score magnitude, not just divergent-count
+    Returns (verdict, confidence, score, signal_names).
+    """
+    vol_trend = vol_profile["vol_trend"] if vol_profile else "FLAT"
+    vol_bias  = vol_profile["vol_bias"]  if vol_profile else "NEUTRAL"
+
+    # DISTRIBUTING penalises the prevailing direction — warns of exhaustion.
+    # No ACCUMULATING bonus: it would promote LEAN+ACC trades (25% WR) to BULLISH.
+    # ACCUMULATING confirmation is already captured via vol_surge upstream.
+    if vol_trend == "DISTRIBUTING":
+        if vol_bias == "BULLISH":
+            signals.append(-1); signal_names.append("VolTrend:DIST-")
+        elif vol_bias == "BEARISH":
+            signals.append(1);  signal_names.append("VolTrend:DIST+")
+
+    if not signals:
+        return "NEUTRAL", "N/A", 0, signal_names
+
+    score = sum(signals)
+
+    # Raised thresholds based on backtest data (score 2 = coin flip, no edge)
+    if score >= 3:
+        verdict = "BULLISH"
+    elif score <= -3:
+        verdict = "BEARISH"
+    elif score >= 2:
+        verdict = "LEAN BULLISH"
+    elif score <= -2:
+        verdict = "LEAN BEARISH"
+    elif score > 0:
+        verdict = "LEAN BULLISH"
+    elif score < 0:
+        verdict = "LEAN BEARISH"
+    else:
+        verdict = "NEUTRAL"
+
+    # Confidence: incorporates both divergent-signal count AND score magnitude
+    bullish_count = sum(1 for s in signals if s > 0)
+    bearish_count = sum(1 for s in signals if s < 0)
+    if primary_candle_bias == "BULLISH":
+        divergent = bearish_count
+    elif primary_candle_bias == "BEARISH":
+        divergent = bullish_count
+    else:
+        divergent = 0
+
+    if primary_candle_bias in ("BULLISH", "BEARISH"):
+        if abs(score) >= 4 and divergent == 0:
+            confidence = "HIGH"
+        elif abs(score) >= 3 and divergent <= 1:
+            confidence = "HIGH"
+        elif divergent == 0:
+            confidence = "MEDIUM"
+        elif divergent == 1:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
+    else:
+        confidence = "N/A"
+
+    return verdict, confidence, score, signal_names
+
+
+def _calc_rsi(close_series, period=14):
+    """Fast RSI calculation using EWM. Handles all-up or all-down series cleanly."""
+    delta = close_series.diff()
+    gain  = delta.clip(lower=0).ewm(com=period - 1, min_periods=period).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, min_periods=period).mean()
+    # When loss == 0: all gains → RSI = 100. Use np.where to avoid NaN.
+    rsi = pd.Series(
+        np.where(loss == 0, 100.0, np.where(gain == 0, 0.0, 100 - 100 / (1 + gain / loss))),
+        index=close_series.index,
+    )
+    # Mask warmup period
+    rsi[gain.isna()] = np.nan
+    return rsi
+
+
 # Popular stocks to scan
 SCAN_WATCHLIST = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AMD", "NFLX", "CRM",
     "ORCL", "ADBE", "INTC", "PYPL", "SQ", "SHOP", "COIN", "UBER", "ABNB", "SNOW",
     "BA", "CAT", "GS", "JPM", "V", "MA", "DIS", "NKE", "SBUX", "MCD",
     "XOM", "CVX", "PFE", "JNJ", "UNH", "MRNA", "LLY", "ABBV", "BMY", "MRK",
-    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "ARKK", "SOXX", "SMH"
+    "SPY", "QQQ", "DIA", "XLF", "XLE", "XLK", "ARKK", "SOXX", "SMH"
+    # IWM removed: trend-following signals have no predictive power on small-cap
+    # mean-reverting ETFs. 44% win rate at score 4+/HIGH conf even after all filters.
+    # Break-even requires 51.9% WR at this R:R ratio — not achievable with current signals.
 ]
+
+# ── Instrument exclusion list ──────────────────────────────────────────────
+# Tickers where the trend-following signal stack has been proven to have no
+# predictive power. Win rate below break-even after all filters applied.
+# Criteria for exclusion: WR < break-even (avg_loss / (avg_win + avg_loss))
+#   after applying score ≥ 4 + HIGH conf + no-short + adaptive ATR filters.
+# To re-enable a ticker: backtest it first on ≥ 30 trades and confirm WR > 55%.
+EXCLUDED_INSTRUMENTS = {
+    "IWM",   # Mean-reverting small-cap ETF. Backtest: 44.4% WR even at score 4+/HIGH.
+             # Now also caught automatically by _classify_instrument persistence check,
+             # but kept here as an explicit hard block with a clear reason string.
+}
+
+
+def _is_instrument_supported(ticker: str, daily_df) -> tuple:
+    """
+    Check whether the current instrument is suitable for the trend-following model.
+    Returns (supported: bool, reason: str).
+    Uses _classify_instrument (data-driven) — no hardcoded ticker lists.
+    """
+    t = ticker.upper().strip()
+
+    # 1. Hard exclusion list (manually backtested failures)
+    if t in EXCLUDED_INSTRUMENTS:
+        return False, (f"{t} is in EXCLUDED_INSTRUMENTS — "
+                       f"trend signals not reliable on this instrument")
+
+    # 2. Data-driven classification — detects mean-reverting behaviour dynamically
+    if daily_df is not None and not daily_df.empty and len(daily_df) >= 40:
+        profile = _classify_instrument(t, daily_df)
+        if profile["is_mean_rev"]:
+            pct   = profile["atr_pct"] * 100
+            pers  = profile["persistence"] * 100
+            qt    = profile["quote_type"]
+            return False, (
+                f"{t} classified as mean-reverting "
+                f"(ATR%={pct:.1f}%, persistence={pers:.0f}%, type={qt}). "
+                f"Trend-following signals unreliable — backtest before trading."
+            )
+
+    return True, ""
+
+
+# ── Dynamic instrument classification ─────────────────────────────────────
+# Replaces hardcoded ETF list. Detects mean-reverting behaviour from price data
+# so any instrument — ETF or stock — is classified correctly without manual upkeep.
+
+def _classify_instrument(ticker: str, daily_df) -> dict:
+    """
+    Dynamically classify an instrument's behaviour from its price history.
+    Returns dict with:
+      atr_14        — 14-day ATR in price units
+      atr_pct       — ATR as % of current price (decimal, e.g. 0.015 = 1.5%)
+      persistence   — % of days price continues prior day's direction (0–1)
+      is_mean_rev   — True if instrument is mean-reverting (apply ETF-style rules)
+      quote_type    — "ETF" | "EQUITY" | "UNKNOWN" (from yfinance when available)
+
+    Classification (3-tier priority):
+      1. yfinance quoteType="ETF"    → is_mean_rev=True  (hard confirm)
+         yfinance quoteType="EQUITY" → is_mean_rev=False (hard confirm)
+      2. No yfinance: persistence < 0.50 AND 1.0% < ATR% ≤ 2.0%
+         (tight fallback — avoids mis-classifying high-vol trending stocks like NVDA)
+    """
+    close  = daily_df["close"].values.astype(float)
+    high   = daily_df["high"].values.astype(float)
+    low    = daily_df["low"].values.astype(float)
+
+    # ATR-14
+    if len(close) >= 15:
+        tr = np.maximum(high[1:] - low[1:],
+             np.maximum(np.abs(high[1:] - close[:-1]),
+                        np.abs(low[1:]  - close[:-1])))
+        atr_14 = float(np.mean(tr[-14:]))
+    else:
+        atr_14 = float(np.mean(high - low))
+    atr_pct = atr_14 / float(close[-1]) if close[-1] > 0 else 0.0
+
+    # Trend persistence — last 60 trading days (~3 months)
+    if len(close) >= 40:
+        directions = np.sign(close[1:] - close[:-1])
+        d = directions[-60:]
+        continuations = int(np.sum((d[1:] == d[:-1]) & (d[:-1] != 0)))
+        total_moves   = int(np.sum(d[:-1] != 0))
+        persistence   = continuations / total_moves if total_moves > 0 else 0.5
+    else:
+        persistence = 0.5
+
+    # quoteType from yfinance (most reliable when available)
+    quote_type = "UNKNOWN"
+    if YFINANCE_AVAILABLE:
+        try:
+            import yfinance as yf
+            qt = yf.Ticker(ticker).info.get("quoteType", "UNKNOWN")
+            quote_type = qt.upper() if qt else "UNKNOWN"
+        except Exception:
+            pass
+
+    # Classification (3-tier):
+    if quote_type == "ETF":
+        is_mean_rev = True
+    elif quote_type == "EQUITY":
+        is_mean_rev = False
+    else:
+        # Fallback — require strong reversal signal:
+        # persistence < 0.50 (actual reversal, not just "not trending")
+        # AND ATR% in 1-2% band (mid-vol instruments like IWM)
+        # Very high ATR% (>2%) stocks are volatile but directional — don't flag them.
+        is_mean_rev = (persistence < 0.50 and 0.010 < atr_pct <= 0.020)
+
+    return {
+        "atr_14":      round(atr_14, 4),
+        "atr_pct":     round(atr_pct, 4),
+        "persistence": round(persistence, 3),
+        "is_mean_rev": is_mean_rev,
+        "quote_type":  quote_type,
+    }
+# Source: 45-trade SPY backtest. Each tier shows observed win rate and avg P&L.
+# Used to annotate live scan results with realistic performance expectations.
+ENTRY_GRADE_TABLE = {
+    # (abs_score, confidence) → (grade, label, expected_wr, expected_avg_pnl, color)
+    (5, "HIGH"):   ("S",  "STRONG ENTER",  100, 3.09,  "#00e5a0"),
+    (4, "HIGH"):   ("A",  "ENTER",          86, 1.19,  "#00e5a0"),
+    (3, "HIGH"):   ("B",  "ENTER",          73, 0.47,  "#4d9fff"),
+    (3, "MEDIUM"): ("B-", "ENTER",          67, 0.35,  "#4d9fff"),
+    (2, "HIGH"):   ("C",  "CAUTION",        50,-0.05,  "#f0c040"),
+    (2, "MEDIUM"): ("C",  "CAUTION",        43,-0.46,  "#f0c040"),
+    (1, "HIGH"):   ("D",  "WEAK — SKIP",    33,-0.76,  "#ff8c42"),
+    (1, "MEDIUM"): ("D",  "WEAK — SKIP",    33,-0.76,  "#ff8c42"),
+}
+
+def _get_entry_grade(score: int, confidence: str) -> dict:
+    """
+    Return backtest-derived entry grade for a given score + confidence.
+    Falls back gracefully for combinations not in the table.
+    """
+    key = (abs(score), confidence)
+    if key in ENTRY_GRADE_TABLE:
+        grade, label, wr, avg_pnl, color = ENTRY_GRADE_TABLE[key]
+    elif abs(score) >= 4 and confidence == "HIGH":
+        grade, label, wr, avg_pnl, color = "A", "ENTER", 86, 1.19, "#00e5a0"
+    elif abs(score) >= 3:
+        grade, label, wr, avg_pnl, color = "B", "ENTER", 67, 0.35, "#4d9fff"
+    elif abs(score) == 2:
+        grade, label, wr, avg_pnl, color = "C", "CAUTION", 47, -0.25, "#f0c040"
+    else:
+        grade, label, wr, avg_pnl, color = "D", "WEAK — SKIP", 33, -0.76, "#ff8c42"
+    return {
+        "entry_grade":    grade,
+        "entry_label":    label,
+        "expected_wr":    wr,
+        "expected_avg":   avg_pnl,
+        "grade_color":    color,
+    }
+
+
+def _compute_weekly_bias(daily_df):
+    """
+    Weekly trend direction from daily data.
+    Bullish: close above prior week high, or uptrend structure (higher highs/lows).
+    Bearish: close below prior week low, or downtrend structure.
+    """
+    try:
+        if daily_df.empty or len(daily_df) < 10:
+            return "NEUTRAL"
+        df = daily_df.copy()
+        df.index = pd.to_datetime(df.index)
+        weekly = df.resample("W").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        if len(weekly) < 3:
+            return "NEUTRAL"
+        curr_close = float(weekly["close"].iloc[-1])
+        prev_high = float(weekly["high"].iloc[-2])
+        prev_low = float(weekly["low"].iloc[-2])
+        # Structure check: last 3 weeks higher highs & higher lows
+        hh = weekly["high"].iloc[-3:].tolist()
+        hl = weekly["low"].iloc[-3:].tolist()
+        uptrend = (hh[-1] > hh[-2] > hh[-3]) or (hl[-1] > hl[-2])
+        downtrend = (hh[-1] < hh[-2] < hh[-3]) or (hl[-1] < hl[-2])
+        if curr_close > prev_high or uptrend:
+            return "BULLISH"
+        elif curr_close < prev_low or downtrend:
+            return "BEARISH"
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+
+def _compute_4h_bias(ticker, daily_df, api_key, api_secret, data_source):
+    """
+    4H entry trigger — check latest 4H candle direction.
+    Pullback to support = bullish; breakdown from resistance = bearish.
+    Falls back to last 2 daily candles if hourly data unavailable.
+    """
+    try:
+        end_date = date.today()
+        start_4h = end_date - timedelta(days=5)
+        hourly_df = pd.DataFrame()
+        if YFINANCE_AVAILABLE:
+            try:
+                hourly_df = get_hourly_bars_yfinance(ticker, str(start_4h), str(end_date))
+            except Exception:
+                pass
+        if hourly_df.empty:
+            try:
+                if data_source == "Alpaca":
+                    hourly_df = get_hourly_bars_alpaca(ticker, str(start_4h), str(end_date), api_key, api_secret)
+                else:
+                    hourly_df = get_hourly_bars(ticker, str(start_4h), str(end_date), api_key)
+            except Exception:
+                pass
+        if not hourly_df.empty and len(hourly_df) >= 4:
+            # Build 4H bars by resampling
+            hdf = hourly_df.copy()
+            hdf.index = pd.to_datetime(hdf.index)
+            bars_4h = hdf.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+            if len(bars_4h) >= 2:
+                last = bars_4h.iloc[-1]
+                prev = bars_4h.iloc[-2]
+                last_bull = float(last["close"]) > float(last["open"])
+                # Pullback to support: prev bearish, current bullish reversal
+                pullback_bull = (float(prev["close"]) < float(prev["open"])) and last_bull
+                # Breakout: current 4H close above prev 4H high
+                breakout_bull = float(last["close"]) > float(prev["high"])
+                last_bear = float(last["close"]) < float(last["open"])
+                pullback_bear = (float(prev["close"]) > float(prev["open"])) and last_bear
+                breakout_bear = float(last["close"]) < float(prev["low"])
+                if pullback_bull or breakout_bull or last_bull:
+                    return "BULLISH"
+                elif pullback_bear or breakout_bear or last_bear:
+                    return "BEARISH"
+                return "NEUTRAL"
+        # Fallback: use last 2 daily candles as proxy
+        if len(daily_df) >= 2:
+            last_d = daily_df.iloc[-1]
+            if float(last_d["close"]) > float(last_d["open"]):
+                return "BULLISH"
+            elif float(last_d["close"]) < float(last_d["open"]):
+                return "BEARISH"
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+
+def _mtf_signal_action(w, d, h4):
+    """
+    Map Weekly / Daily / 4H bias combo to (rank, signal, action).
+    rank: 1 = best (all aligned), 2 = 2-of-3 aligned, 3+ = weaker/conflicting.
+    """
+    key = (
+        "B" if "BULLISH" in (w or "") else ("R" if "BEARISH" in (w or "") else "N"),
+        "B" if "BULLISH" in (d or "") else ("R" if "BEARISH" in (d or "") else "N"),
+        "B" if "BULLISH" in (h4 or "") else ("R" if "BEARISH" in (h4 or "") else "N"),
+    )
+    _MAP = {
+        # ── Rank 1: All three aligned ──
+        ("B","B","B"): (1, "A+ Long",  "Full size CALL — all TFs agree"),
+        ("R","R","R"): (1, "A+ Short", "Full size PUT — all TFs agree"),
+        # ── Rank 2: Two aligned + neutral ──
+        ("B","B","N"): (2, "Strong Long, wait 4H",    "Long confirmed — wait for 4H trigger"),
+        ("B","N","B"): (2, "Long pullback entry",     "Weekly up, daily pausing, 4H triggering — dip buy"),
+        ("N","B","B"): (2, "Short-term Long",         "No weekly trend — smaller size, quick target"),
+        ("R","R","N"): (2, "Strong Short, wait 4H",   "Short confirmed — wait for 4H breakdown"),
+        ("R","N","R"): (2, "Short pullback entry",    "Weekly down, daily pausing, 4H confirming"),
+        ("N","R","R"): (2, "Short-term Short",        "No weekly trend — smaller size PUT"),
+        # ── Rank 3: Two aligned + one conflicting ──
+        ("B","B","R"): (3, "Pullback in uptrend",     "4H dip in bull trend — buy-the-dip if support holds"),
+        ("R","R","B"): (3, "Dead cat bounce",         "4H bounce in downtrend — fade rally or wait"),
+        ("B","R","B"): (3, "Choppy / reversal fight", "Mixed signals — reduce size"),
+        ("R","B","R"): (3, "Counter-trend failing",   "Daily bounce but 4H rejecting — likely resumes down"),
+        ("B","R","R"): (3, "Trend reversal warning",  "Weekly up but D+4H selling — no longs"),
+        ("R","B","B"): (3, "Counter-trend bounce",    "D+4H bouncing vs weekly down — risky long, tight stop"),
+        # ── Rank 4: One signal only ──
+        ("B","N","N"): (4, "Too early — Long",        "Weekly up, no confirmation — watchlist only"),
+        ("N","B","N"): (4, "Unconfirmed Long",        "Only daily bullish — need weekly or 4H"),
+        ("N","N","B"): (4, "Noise — Long",            "Only 4H up — likely just a bounce"),
+        ("R","N","N"): (4, "Too early — Short",       "Weekly down, no confirmation — watchlist"),
+        ("N","R","N"): (4, "Unconfirmed Short",       "Only daily bearish — need more"),
+        ("N","N","R"): (4, "Noise — Short",           "Only 4H down — likely just a dip"),
+        # ── Rank 4: Mixed with neutral ──
+        ("B","R","N"): (4, "Conflicted",              "Weekly up, daily down — wait for resolution"),
+        ("B","N","R"): (4, "4H selling in uptrend",   "Watch for 4H reversal candle — possible dip buy"),
+        ("R","B","N"): (4, "Counter-trend attempt",   "Daily bouncing vs weekly down — risky, sit out"),
+        ("R","N","B"): (4, "4H bounce in downtrend",  "Likely dead cat — wait for daily confirm"),
+        ("N","B","R"): (4, "Daily up, 4H failing",    "4H rejecting — daily move may exhaust"),
+        ("N","R","B"): (4, "Daily down, 4H bouncing", "Speculative bottom fish — very small size only"),
+        # ── Rank 5: No edge ──
+        ("N","N","N"): (5, "No edge",                 "Sit out — no directional conviction"),
+    }
+    return _MAP.get(key, (5, "Unknown", "No data"))
+
 
 def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fib_tol=2.0, use_strategy=False):
     """
@@ -1858,32 +3073,14 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
         
         if daily_df.empty or len(daily_df) < 20:
             return None
-        
+
+        # ── Instrument suitability gate ──
+        supported, reason = _is_instrument_supported(ticker, daily_df)
+        if not supported:
+            return None   # Silently skip unsupported instruments in scanner
+
         current_price = daily_df["close"].iloc[-1]
-        
-        # 4H candle for today (if market is open) or last trading day
-        hourly_df = None
-        candle_4h_bias = "N/A"
-        try:
-            hourly_start = end_date - timedelta(days=7)
-            if data_source == "Alpaca":
-                hourly_df = get_hourly_bars_alpaca(ticker, str(hourly_start), str(end_date), api_key, api_secret)
-            else:
-                hourly_df = get_hourly_bars(ticker, str(hourly_start), str(end_date), api_key)
-            
-            if hourly_df is not None and not hourly_df.empty:
-                # Try today, then yesterday
-                for check_date in [end_date, end_date - timedelta(days=1), end_date - timedelta(days=2)]:
-                    candle_4h = get_4h_noon_candle(ticker, check_date, hourly_df)
-                    if candle_4h:
-                        if candle_4h["close"] > candle_4h["open"]:
-                            candle_4h_bias = "BULLISH"
-                        elif candle_4h["close"] < candle_4h["open"]:
-                            candle_4h_bias = "BEARISH"
-                        break
-        except:
-            pass
-        
+
         # Fibonacci bias
         fib_bias = "NEUTRAL"
         if use_fib:
@@ -1895,94 +3092,73 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
                     fib_name = fib_result[0]
                     fib_pct = float(fib_name.split()[1].replace("%", ""))
                     if fib_pct >= 61.8:
-                        fib_bias = "BEARISH"  # Near highs = resistance
+                        fib_bias = "BEARISH"
                     elif fib_pct <= 38.2:
-                        fib_bias = "BULLISH"  # Near lows = support
+                        fib_bias = "BULLISH"
             except:
                 pass
-        
-        # Options bias — try yfinance first (free), fall back to Alpaca/Polygon
-        options_oi_bias = "N/A"
-        options_vol_bias = "N/A"
-        options_delta_bias = "N/A"
-        try:
-            options_data = None
-            if YFINANCE_AVAILABLE:
-                options_data = get_options_bias_yfinance(ticker)
-                if options_data and "error" in options_data:
-                    options_data = None
-            if options_data is None:
-                if data_source == "Alpaca":
-                    options_data = get_options_bias_alpaca(ticker, api_key, api_secret)
-                else:
-                    options_data = get_options_bias(ticker, api_key)
-            
-            if options_data and "error" not in options_data:
-                options_oi_bias = options_data.get("sentiment", "NEUTRAL")
-                options_vol_bias = options_data.get("vol_sentiment", "N/A")
-                options_delta_bias = options_data.get("delta_sentiment", "N/A")
-        except:
-            pass
-        
+
         # Support / Resistance levels
         sr_data = None
         try:
             sr_data = calc_support_resistance(daily_df)
         except:
             pass
-        
-        # Calculate signals
+
+        # ── Build signals — identical to _estimator_signal_at ─────────────────
+        # Daily candle direction is the PRIMARY signal (×2).
+        # Matches backtest engine exactly — grades reflect real historical WR.
         signals = []
         signal_names = []
-        
-        # 4H Candle (double weight)
-        if candle_4h_bias == "BULLISH":
-            signals.append(2)
-            signal_names.append("4H:BULL")
-        elif candle_4h_bias == "BEARISH":
-            signals.append(-2)
-            signal_names.append("4H:BEAR")
-        
-        # Fibonacci
+
+        # 1. Daily candle direction (double weight — primary, backtest-proven)
+        daily_close = float(daily_df["close"].iloc[-1])
+        daily_open  = float(daily_df["open"].iloc[-1])
+        candle_bias = "N/A"
+        if daily_close > daily_open:
+            signals.append(2); signal_names.append("Day:BULL")
+            candle_bias = "BULLISH"
+        elif daily_close < daily_open:
+            signals.append(-2); signal_names.append("Day:BEAR")
+            candle_bias = "BEARISH"
+
+        # 2. Fibonacci (with S/R confluence bonus)
         if fib_bias == "BULLISH":
-            signals.append(1)
-            signal_names.append("Fib:BULL")
+            signals.append(1); signal_names.append("Fib:BULL")
+            if sr_data and sr_data.get("key_level"):
+                kl = sr_data["key_level"]["price"]
+                if abs(kl - current_price) / current_price < 0.015:
+                    signals.append(1); signal_names.append("Fib+SR:BULL")
         elif fib_bias == "BEARISH":
-            signals.append(-1)
-            signal_names.append("Fib:BEAR")
-        else:
-            signals.append(0)
+            signals.append(-1); signal_names.append("Fib:BEAR")
+            if sr_data and sr_data.get("key_level"):
+                kl = sr_data["key_level"]["price"]
+                if abs(kl - current_price) / current_price < 0.015:
+                    signals.append(-1); signal_names.append("Fib+SR:BEAR")
         
-        # Options OI
-        if options_oi_bias == "BULLISH":
-            signals.append(1)
-            signal_names.append("OI:BULL")
-        elif options_oi_bias == "BEARISH":
-            signals.append(-1)
-            signal_names.append("OI:BEAR")
-        elif options_oi_bias == "NEUTRAL":
-            signals.append(0)
-        
-        # Options Volume
-        if options_vol_bias == "BULLISH":
-            signals.append(1)
-            signal_names.append("Vol:BULL")
-        elif options_vol_bias == "BEARISH":
-            signals.append(-1)
-            signal_names.append("Vol:BEAR")
-        elif options_vol_bias == "NEUTRAL":
-            signals.append(0)
-        
-        # Options Delta-Adjusted
-        if options_delta_bias == "BULLISH":
-            signals.append(1)
-            signal_names.append("Δ:BULL")
-        elif options_delta_bias == "BEARISH":
-            signals.append(-1)
-            signal_names.append("Δ:BEAR")
-        elif options_delta_bias == "NEUTRAL":
-            signals.append(0)
-        
+        # Volume Profile bias + surge
+        vol_profile = None
+        vol_bias = "NEUTRAL"
+        try:
+            vol_profile = analyze_volume_profile(daily_df, lookback=50)
+            if vol_profile:
+                vol_bias = vol_profile["vol_bias"]
+                if vol_bias == "BULLISH":
+                    signals.append(1)
+                    signal_names.append("Vol:BULL")
+                elif vol_bias == "BEARISH":
+                    signals.append(-1)
+                    signal_names.append("Vol:BEAR")
+                if vol_profile["vol_surge"]:
+                    if vol_bias == "BULLISH":
+                        signals.append(1)
+                        signal_names.append("VolSurge:BULL")
+                    elif vol_bias == "BEARISH":
+                        signals.append(-1)
+                        signal_names.append("VolSurge:BEAR")
+        except:
+            pass
+
         # Strategy (optional)
         if use_strategy:
             try:
@@ -1998,88 +3174,77 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
                 pass
         
         if not signals:
-            return None
-        
-        # Calculate verdict
-        score = sum(signals)
-        
-        if score >= 2:
-            verdict = "BULLISH"
-        elif score <= -2:
-            verdict = "BEARISH"
-        elif score > 0:
-            verdict = "LEAN BULLISH"
-        elif score < 0:
-            verdict = "LEAN BEARISH"
+            skip_reason = "No signals (doji + no Fib/Vol data)"
         else:
-            verdict = "NEUTRAL"
-        
-        # Calculate confidence
-        bullish_count = sum(1 for s in signals if s > 0)
-        bearish_count = sum(1 for s in signals if s < 0)
-        
-        if candle_4h_bias == "BULLISH":
-            divergent = bearish_count
-        elif candle_4h_bias == "BEARISH":
-            divergent = bullish_count
+            skip_reason = None
+
+        # ── Centralised verdict / confidence / score ──
+        if not signals:
+            # Still compute minimal result for display
+            verdict, confidence, score = "NEUTRAL", "N/A", 0
+            vol_trend = vol_profile["vol_trend"] if vol_profile else "N/A"
+            signal_names = []
         else:
-            divergent = 0
-        
-        if candle_4h_bias in ["BULLISH", "BEARISH"]:
-            if divergent == 0:
-                confidence = "HIGH"
-            elif divergent == 1:
-                confidence = "MEDIUM"
-            else:
-                confidence = "LOW"
-        else:
-            confidence = "N/A"
-        
-        # Calculate Entry/Exit levels
-        recent_low = daily_df["low"].iloc[-10:].min()  # 10-day low for stop
-        recent_high = daily_df["high"].iloc[-10:].max()  # 10-day high
-        atr_14 = (daily_df["high"] - daily_df["low"]).rolling(14).mean().iloc[-1]  # ATR for sizing
-        
-        # Average daily move (for timeframe estimates)
-        avg_daily_move = atr_14 * 0.6  # Conservative: ~60% of ATR as expected daily progress
-        
+            verdict, confidence, score, signal_names = _compute_verdict_confidence_score(
+                signals, signal_names, candle_bias, vol_profile
+            )
+            vol_trend = vol_profile["vol_trend"] if vol_profile else "N/A"
+
+            # ── Filters — record reason but don't return None ──────────────────
+            if verdict == "NEUTRAL":
+                skip_reason = "NEUTRAL — no directional edge"
+            elif score <= -4:
+                skip_reason = f"Score {score} — extreme score block"
+            elif confidence == "LOW":
+                skip_reason = "LOW confidence"
+            elif abs(score) >= 3:
+                lc = (verdict in ("BULLISH", "LEAN BULLISH")  and vol_bias == "BEARISH")
+                sc_ = (verdict in ("BEARISH", "LEAN BEARISH") and vol_bias == "BULLISH")
+                if lc or sc_:
+                    skip_reason = f"Vol conflict — {verdict} but vol={vol_bias}"
+
+        # ── Per-ticker adaptive rules ─────────────────────────────────────────
+        profile     = _classify_instrument(ticker, daily_df)
+        atr_14      = profile["atr_14"]
+        atr_pct     = profile["atr_pct"]
+        is_mean_rev = profile["is_mean_rev"]
+
+        if skip_reason is None:
+            if is_mean_rev and verdict in ("BEARISH", "LEAN BEARISH"):
+                skip_reason = f"Mean-rev instrument — no SHORT"
+            elif is_mean_rev and abs(score) < 4:
+                skip_reason = f"Mean-rev instrument — score {score} < 4 required"
+
+        entry_status = "ENTER" if skip_reason is None else f"SKIP — {skip_reason}"
+        atr_mult = 0.3 if is_mean_rev else 0.5
+
+        # ── Entry/Exit levels (computed for all — useful context even for skips) ──
+        recent_low  = daily_df["low"].iloc[-10:].min()
+        recent_high = daily_df["high"].iloc[-10:].max()
+        avg_daily_move = atr_14 * 0.6
+
         if verdict in ["BULLISH", "LEAN BULLISH"]:
-            # Long setup
-            entry = round(current_price, 2)
-            stop_loss = round(recent_low - atr_14 * 0.5, 2)  # Below recent low
-            risk = entry - stop_loss
-            target1 = round(entry + risk * 2, 2)  # 2:1 R:R
-            target2 = round(entry + risk * 3, 2)  # 3:1 R:R
-            risk_pct = round((risk / entry) * 100, 1)
-            
-            # Timeframe estimates (in trading days)
-            dist_to_t1 = target1 - entry
-            dist_to_t2 = target2 - entry
-            t1_days = max(1, round(dist_to_t1 / avg_daily_move)) if avg_daily_move > 0 else None
-            t2_days = max(1, round(dist_to_t2 / avg_daily_move)) if avg_daily_move > 0 else None
-            
+            entry     = round(current_price, 2)
+            stop_loss = round(recent_low - atr_14 * atr_mult, 2)
+            risk      = entry - stop_loss
+            target1   = round(entry + risk * 2, 2)
+            target2   = round(entry + risk * 3, 2)
+            risk_pct  = round((risk / entry) * 100, 1)
+            t1_days   = max(1, round((target1 - entry) / avg_daily_move)) if avg_daily_move > 0 else None
+            t2_days   = max(1, round((target2 - entry) / avg_daily_move)) if avg_daily_move > 0 else None
         elif verdict in ["BEARISH", "LEAN BEARISH"]:
-            # Short setup
-            entry = round(current_price, 2)
-            stop_loss = round(recent_high + atr_14 * 0.5, 2)  # Above recent high
-            risk = stop_loss - entry
-            target1 = round(entry - risk * 2, 2)  # 2:1 R:R
-            target2 = round(entry - risk * 3, 2)  # 3:1 R:R
-            risk_pct = round((risk / entry) * 100, 1)
-            
-            # Timeframe estimates (in trading days)
-            dist_to_t1 = entry - target1
-            dist_to_t2 = entry - target2
-            t1_days = max(1, round(dist_to_t1 / avg_daily_move)) if avg_daily_move > 0 else None
-            t2_days = max(1, round(dist_to_t2 / avg_daily_move)) if avg_daily_move > 0 else None
+            entry     = round(current_price, 2)
+            stop_loss = round(recent_high + atr_14 * atr_mult, 2)
+            risk      = stop_loss - entry
+            target1   = round(entry - risk * 2, 2)
+            target2   = round(entry - risk * 3, 2)
+            risk_pct  = round((risk / entry) * 100, 1)
+            t1_days   = max(1, round((entry - target1) / avg_daily_move)) if avg_daily_move > 0 else None
+            t2_days   = max(1, round((entry - target2) / avg_daily_move)) if avg_daily_move > 0 else None
         else:
-            entry = round(current_price, 2)
-            stop_loss = None
-            target1 = None
-            target2 = None
-            risk_pct = None
-            t1_days = None
-            t2_days = None
+            entry     = round(current_price, 2)
+            stop_loss = None; target1 = None; target2 = None
+            risk_pct  = None; t1_days = None; t2_days = None
         
         # Get fundamentals (valuation + growth + profitability + risk)
         fundamentals = get_fundamentals(ticker)
@@ -2088,32 +3253,64 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
         market_cap = fundamentals.get("market_cap_str", "N/A") if fundamentals else "N/A"
         target_price_1y = fundamentals.get("target_price") if fundamentals else None
         target_upside = fundamentals.get("target_upside") if fundamentals else None
+
+        # ── Multi-timeframe biases (Weekly / 4H) ──
+        weekly_bias = _compute_weekly_bias(daily_df)
+        four_h_bias = _compute_4h_bias(ticker, daily_df, api_key, api_secret, data_source)
         
         result = {
-            "ticker": ticker,
-            "price": round(current_price, 2),
-            "verdict": verdict,
-            "confidence": confidence,
-            "score": score,
-            "signals": ", ".join(signal_names),
-            "4h": candle_4h_bias,
-            "fib": fib_bias,
-            "options_oi": options_oi_bias,
-            "options_vol": options_vol_bias,
-            "options_delta": options_delta_bias,
-            "entry": entry,
-            "stop_loss": stop_loss,
-            "target1": target1,
-            "target2": target2,
-            "risk_pct": risk_pct,
-            "t1_days": t1_days,
-            "t2_days": t2_days,
-            "valuation": valuation,
-            "valuation_color": valuation_color,
-            "market_cap": market_cap,
-            "target_1y": target_price_1y,
-            "target_upside": target_upside,
+            "ticker":      ticker,
+            "price":       round(current_price, 2),
+            "entry_status": entry_status,
+            "weekly_bias": weekly_bias,
+            "daily_bias":  candle_bias,
+            "4h_bias":     four_h_bias,
+            "verdict":     verdict,
+            "confidence":  confidence,
+            "score":       score,
+            "signals":     ", ".join(signal_names),
+            "candle":      candle_bias,
+            "fib":         fib_bias,
+            "vol_action":  vol_bias,
+            "vol_trend":   vol_profile["vol_trend"] if vol_profile else "N/A",
+            "vol_ratio":   vol_profile["vol_ratio"] if vol_profile else None,
+            "poc":         vol_profile["poc"] if vol_profile else None,
+            "val":         vol_profile["val"] if vol_profile else None,
+            "vah":         vol_profile["vah"] if vol_profile else None,
+            "vol_detail":  vol_profile["detail"] if vol_profile else "",
+            "best_setup":  "Y" if (score >= 4 and confidence == "HIGH") else "N",
+            "is_mean_rev": profile["is_mean_rev"],
+            "persistence": round(profile["persistence"] * 100, 1),
+            "quote_type":  profile["quote_type"],
+            "entry":       entry,
+            "stop_loss":   stop_loss,
+            "target1":     target1,
+            "target2":     target2,
+            "risk_pct":    risk_pct,
+            "t1_days":     t1_days,
+            "t2_days":     t2_days,
+            "valuation":        valuation,
+            "valuation_color":  valuation_color,
+            "market_cap":       market_cap,
+            "target_1y":        target_price_1y,
+            "target_upside":    target_upside,
         }
+
+        # ── Multi-timeframe signal & action ──
+        mtf_rank, mtf_signal, mtf_action = _mtf_signal_action(weekly_bias, candle_bias, four_h_bias)
+        result["mtf_rank"]   = mtf_rank
+        result["mtf_signal"] = mtf_signal
+        result["mtf_action"] = mtf_action
+
+        # Entry grade — shown for all trades; grade reflects signal strength
+        grade_info = _get_entry_grade(score, confidence)
+        result.update(grade_info)
+        # Override grade label for filtered trades so it's crystal clear
+        if entry_status != "ENTER":
+            result["entry_label"] = entry_status
+
+        _, suitability_reason = _is_instrument_supported(ticker, daily_df)
+        result["suitability_reason"] = suitability_reason
         # Attach support/resistance levels
         if sr_data:
             result["supports"] = sr_data.get("supports", [])
@@ -2129,7 +3326,8 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
                 result[fkey] = fundamentals.get(fkey)
         return result
     except Exception as e:
-        return None
+        # Re-raise with ticker context so the caller can surface the real error
+        raise RuntimeError(f"scan_single_stock({ticker}): {type(e).__name__}: {e}") from e
 
 
 def scan_stocks(api_key, api_secret, data_source, watchlist=None, use_fib=True, fib_tol=2.0, use_strategy=False):
@@ -2146,13 +3344,309 @@ def scan_stocks(api_key, api_secret, data_source, watchlist=None, use_fib=True, 
         if result:
             results.append(result)
     
-    # Filter for BULLISH + HIGH confidence
-    bullish_high = [r for r in results if r["verdict"] == "BULLISH" and r["confidence"] == "HIGH"]
-    
-    # Sort by score descending
+    # Top LONG setups: BULLISH + HIGH confidence, score >= 3
+    bullish_high = [
+        r for r in results
+        if r["verdict"] == "BULLISH" and r["confidence"] == "HIGH" and r.get("score", 0) >= 3
+    ]
     bullish_high.sort(key=lambda x: x["score"], reverse=True)
-    
-    return bullish_high[:5], results
+
+    # Top SHORT setups: BEARISH + HIGH confidence, score <= -3
+    bearish_high = [
+        r for r in results
+        if r["verdict"] == "BEARISH" and r["confidence"] == "HIGH" and r.get("score", 0) <= -3
+    ]
+    bearish_high.sort(key=lambda x: x["score"])
+
+    top_setups = bullish_high[:5] + bearish_high[:5]
+    return top_setups, results
+
+
+# ──────────────────────────────────────────────
+# ESTIMATOR BACKTEST
+# ──────────────────────────────────────────────
+
+def _estimator_signal_at(daily_df, idx, use_fib=True, fib_tol=2.0, ticker=""):
+    """
+    Compute the estimator verdict/score/levels for a single bar index
+    using only data available up to (and including) that index.
+    Improvements: raised score thresholds, vol-trend modifier,
+    score-aware confidence, redefined best_setup, per-ticker adaptive rules.
+    Returns dict with verdict, score, entry, stop, target1, best_setup, etc. or None.
+    """
+    if idx < 50:
+        return None
+    df = daily_df.iloc[:idx + 1].copy()
+    current_price = float(df["close"].iloc[-1])
+
+    # Fibonacci bias
+    fib_bias = "NEUTRAL"
+    if use_fib:
+        try:
+            hi_52 = df["high"].rolling(min(252, len(df))).max().iloc[-1]
+            lo_52 = df["low"].rolling(min(252, len(df))).min().iloc[-1]
+            fib_result = nearest_fib(current_price, lo_52, hi_52, fib_tol)
+            if fib_result:
+                fib_pct = float(fib_result[0].split()[1].replace("%", ""))
+                if fib_pct >= 61.8:
+                    fib_bias = "BEARISH"
+                elif fib_pct <= 38.2:
+                    fib_bias = "BULLISH"
+        except:
+            pass
+
+    # Volume Profile
+    vol_profile = None
+    vol_bias = "NEUTRAL"
+    try:
+        vol_profile = analyze_volume_profile(df, lookback=50)
+        if vol_profile:
+            vol_bias = vol_profile["vol_bias"]
+    except:
+        pass
+
+    # ── Build signals ──
+    signals = []
+    signal_names = []
+
+    # Daily candle direction (double weight — primary signal)
+    candle_bias = "N/A"
+    if df["close"].iloc[-1] > df["open"].iloc[-1]:
+        signals.append(2); signal_names.append("Day:BULL")
+        candle_bias = "BULLISH"
+    elif df["close"].iloc[-1] < df["open"].iloc[-1]:
+        signals.append(-2); signal_names.append("Day:BEAR")
+        candle_bias = "BEARISH"
+
+    # Fibonacci
+    if fib_bias == "BULLISH":
+        signals.append(1); signal_names.append("Fib:BULL")
+    elif fib_bias == "BEARISH":
+        signals.append(-1); signal_names.append("Fib:BEAR")
+
+    # Volume Profile bias
+    if vol_bias == "BULLISH":
+        signals.append(1); signal_names.append("Vol:BULL")
+    elif vol_bias == "BEARISH":
+        signals.append(-1); signal_names.append("Vol:BEAR")
+
+    # Surge amplifier
+    if vol_profile and vol_profile["vol_surge"]:
+        if vol_bias == "BULLISH":
+            signals.append(1); signal_names.append("VolSurge:BULL")
+        elif vol_bias == "BEARISH":
+            signals.append(-1); signal_names.append("VolSurge:BEAR")
+
+    if not signals:
+        return None
+
+    # ── Centralised verdict / confidence / score ──
+    verdict, confidence, score, signal_names = _compute_verdict_confidence_score(
+        signals, signal_names, candle_bias, vol_profile
+    )
+
+    # ── Drawdown filters ────────────────────────────────────────────────────
+    # Filter A: Hard block score -4
+    if score <= -4:
+        return None
+
+    # Filter B: Skip LOW confidence
+    if confidence == "LOW":
+        return None
+
+    # Filter C: Vol conflict — only block high-conviction signals (|score|>=3)
+    #           LEAN trades (score ±2) pass through — vol profile lags daily
+    #           candle direction on individual stocks by days/weeks.
+    if abs(score) >= 3:
+        long_vol_conflict  = (verdict in ("BULLISH", "LEAN BULLISH")  and vol_bias == "BEARISH")
+        short_vol_conflict = (verdict in ("BEARISH", "LEAN BEARISH") and vol_bias == "BULLISH")
+        if long_vol_conflict or short_vol_conflict:
+            return None
+
+    # ── Per-ticker adaptive rules ────────────────────────────────────────────
+    profile     = _classify_instrument(ticker, df)
+    atr_14      = profile["atr_14"]
+    atr_pct     = profile["atr_pct"]
+    is_mean_rev = profile["is_mean_rev"]
+
+    # Block SHORT on mean-reverting instruments
+    if is_mean_rev and verdict in ("BEARISH", "LEAN BEARISH"):
+        return None
+
+    # Require score ≥ 4 on mean-reverting instruments
+    if is_mean_rev and abs(score) < 4:
+        return None
+
+    # Tighter ATR stop on mean-reverting instruments only
+    atr_mult = 0.3 if is_mean_rev else 0.5
+
+    # Entry / Stop / Target
+    recent_low = df["low"].iloc[-10:].min()
+    recent_high = df["high"].iloc[-10:].max()
+
+    avg_daily_move = atr_14 * 0.6
+
+    if verdict in ("BULLISH", "LEAN BULLISH"):
+        entry = current_price
+        stop = round(float(recent_low - atr_14 * atr_mult), 2)
+        risk = entry - stop
+        t1 = round(entry + risk * 2, 2)
+        direction = "LONG"
+        dist_to_t1 = t1 - entry
+        vol_trend = vol_profile["vol_trend"] if vol_profile else "FLAT"
+        hold_multiplier = 0.7 if vol_trend == "DISTRIBUTING" else 1.0
+    elif verdict in ("BEARISH", "LEAN BEARISH"):
+        entry = current_price
+        stop = round(float(recent_high + atr_14 * atr_mult), 2)
+        risk = stop - entry
+        t1 = round(entry - risk * 2, 2)
+        direction = "SHORT"
+        dist_to_t1 = entry - t1
+        vol_trend = vol_profile["vol_trend"] if vol_profile else "FLAT"
+        hold_multiplier = 0.7
+    else:
+        return None
+
+    t1_days = max(1, round((dist_to_t1 / avg_daily_move) * hold_multiplier)) if avg_daily_move > 0 else 5
+
+    vol_trend = vol_profile["vol_trend"] if vol_profile else "N/A"
+
+    # Redefined best_setup: score >= 4 and HIGH confidence (data-driven threshold)
+    best_setup = (abs(score) >= 4 and confidence == "HIGH")
+
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "score": score,
+        "direction": direction,
+        "entry": round(entry, 2),
+        "stop": stop,
+        "target1": t1,
+        "t1_days": t1_days,
+        "vol_bias": vol_bias,
+        "vol_trend": vol_trend,
+        "fib_bias": fib_bias,
+        "candle_bias": candle_bias,
+        "best_setup": best_setup,
+        "signals": ", ".join(signal_names),
+    }
+
+
+def backtest_estimator(daily_df, use_fib=True, fib_tol=2.0, hold_days=5,
+                       filter_best_only=False,
+                       use_dynamic_hold=True, ticker=""):
+    """
+    Walk-forward backtest of estimator signals.
+    Uses daily candle + Fib + Volume Profile signals.
+    If use_dynamic_hold=True, each trade uses the ATR-based t1_days from the signal
+    instead of a fixed hold_days.
+    ticker: passed through for per-instrument adaptive rules (IWM, QQQ, etc.)
+    Returns DataFrame of trades with P&L.
+    """
+    if daily_df is None or len(daily_df) < 80:
+        return pd.DataFrame()
+
+    trades = []
+    dates = list(daily_df.index)
+    i = 60  # start after enough warmup data
+    min_advance = max(1, hold_days) if not use_dynamic_hold else 1
+
+    while i < len(daily_df) - min_advance:
+        sig = _estimator_signal_at(daily_df, i, use_fib, fib_tol, ticker=ticker)
+        if sig is None:
+            i += (hold_days if not use_dynamic_hold else 1)
+            continue
+
+        if filter_best_only and not sig["best_setup"]:
+            i += (hold_days if not use_dynamic_hold else 1)
+            continue
+
+        if sig["verdict"] == "NEUTRAL":
+            i += (hold_days if not use_dynamic_hold else 1)
+            continue
+
+        entry_date = dates[i]
+        entry_px = sig["entry"]
+        stop_px = sig["stop"]
+        t1_px = sig["target1"]
+        direction = sig["direction"]
+
+        # Use dynamic ATR-based hold or fixed hold_days
+        trade_hold = sig["t1_days"] if use_dynamic_hold else hold_days
+
+        # Walk forward up to trade_hold days to check stop/target
+        exit_px = None
+        exit_date = None
+        exit_reason = None
+        for j in range(1, trade_hold + 1):
+            if i + j >= len(daily_df):
+                break
+            bar_high = float(daily_df["high"].iloc[i + j])
+            bar_low = float(daily_df["low"].iloc[i + j])
+            bar_close = float(daily_df["close"].iloc[i + j])
+            bar_date = dates[i + j]
+
+            if direction == "LONG":
+                if bar_low <= stop_px:
+                    exit_px = stop_px
+                    exit_date = bar_date
+                    exit_reason = "STOP"
+                    break
+                if bar_high >= t1_px:
+                    exit_px = t1_px
+                    exit_date = bar_date
+                    exit_reason = "TARGET"
+                    break
+            else:  # SHORT — take target on close (enforce exit discipline; every SHORT STOP is a loser)
+                if bar_high >= stop_px:
+                    exit_px = stop_px
+                    exit_date = bar_date
+                    exit_reason = "STOP"
+                    break
+                # Use bar_close for target: exit when price closes at/below target, not just wicks
+                if bar_close <= t1_px:
+                    exit_px = t1_px
+                    exit_date = bar_date
+                    exit_reason = "TARGET"
+                    break
+
+        # If neither stop nor target hit, exit at close of last hold day
+        if exit_px is None:
+            last_j = min(i + trade_hold, len(daily_df) - 1)
+            exit_px = float(daily_df["close"].iloc[last_j])
+            exit_date = dates[last_j]
+            exit_reason = "EXPIRE"
+
+        if direction == "LONG":
+            pnl_pct = (exit_px - entry_px) / entry_px * 100
+        else:
+            pnl_pct = (entry_px - exit_px) / entry_px * 100
+
+        trades.append({
+            "entry_date": str(entry_date),
+            "exit_date": str(exit_date),
+            "direction": direction,
+            "verdict": sig["verdict"],
+            "confidence": sig["confidence"],
+            "best_setup": "Y" if sig["best_setup"] else "N",
+            "vol_bias": sig["vol_bias"],
+            "vol_trend": sig["vol_trend"],
+            "fib_bias": sig["fib_bias"],
+            "score": sig["score"],
+            "hold_days": trade_hold,
+            "entry": round(entry_px, 2),
+            "stop": stop_px,
+            "target1": sig["target1"],
+            "exit": round(exit_px, 2),
+            "exit_reason": exit_reason,
+            "pnl_pct": round(pnl_pct, 2),
+            "win": pnl_pct > 0,
+            "signals": sig["signals"],
+        })
+
+        i += trade_hold  # advance past hold period
+
+    return pd.DataFrame(trades) if trades else pd.DataFrame()
 
 
 def run_backtest(ticker, daily_df, hourly_df, earnings_events,
@@ -2700,17 +4194,21 @@ if "fetched_data" not in st.session_state:
 default_watchlist = "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,AMD,NFLX,CRM,ORCL,ADBE,INTC,PYPL,SQ,SHOP,COIN,UBER,ABNB,SNOW,BA,CAT,GS,JPM,V,MA,DIS,NKE,SBUX,MCD,XOM,CVX,PFE,JNJ,UNH,MRNA,LLY,ABBV,BMY,MRK,SPY,QQQ,IWM,DIA,XLF,XLE,XLK,ARKK,SOXX,SMH"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN TABS — 4 Pages
+# MAIN TABS — 6 Pages
 # ══════════════════════════════════════════════════════════════════════════════
-tab_fetch, tab_estimator, tab_sector, tab_scanner = st.tabs([
-    "📅 Earnings Analysis",
-    "🔬 Earnings Estimator",
+tab_fetch, tab_estimator, tab_sector, tab_backtest, tab_plan, tab_trades, tab_holdings, tab_macro = st.tabs([
+    "📅 Stock Analysis (with Options)",
+    "🔬 Stock Analysis",
     "🔥 Sector Scan",
-    "🔍 Technical Scanner",
+    "📊 Backtest",
+    "🗓️ Intraday Planning",
+    "📋 Trade Tracker",
+    "💼 My Holdings",
+    "🌍 Macro",
 ])
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 1: EARNINGS ANALYSIS (Fetch Earnings + Run Backtest)                    ║
+# ║ TAB 1: STOCK ANALYSIS (with Options) — Fetch Earnings + Analysis            ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 with tab_fetch:
     st.markdown(
@@ -2761,7 +4259,9 @@ with tab_fetch:
     with fe_btn1:
         fetch_btn = st.button("📅 FETCH EARNINGS", use_container_width=True, type="primary", key="btn_fetch")
     with fe_btn2:
-        run_btn = st.button("▶ RUN BACKTEST", use_container_width=True, key="btn_run")
+        # run_btn = st.button("▶ RUN BACKTEST", use_container_width=True, key="btn_run")
+        pass
+    run_btn = False  # Backtest moved to Backtest tab
 
     if not fetch_btn and not run_btn:
         if st.session_state.fetched_data is not None:
@@ -2769,7 +4269,7 @@ with tab_fetch:
             st.markdown(
                 f'<div style="background:#0d0f1799;border:1px solid #1a1d2e;padding:12px;border-radius:4px;margin-bottom:12px">'
                 f'<div style="font-size:11px;color:#6b7099">📅 <b style="color:#e8ecff">{data["symbol"]}</b> · '
-                f'{len(data["earnings_events"])} earnings events loaded · Click <b style="color:#00e5a0">▶ RUN BACKTEST</b></div>'
+                f'{len(data["earnings_events"])} earnings events loaded</div>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -2784,7 +4284,7 @@ with tab_fetch:
             )
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 2: EARNINGS ESTIMATOR (Technical + Fundamental, CSV export)             ║
+# ║ TAB 2: STOCK ANALYSIS (Technical + Fundamental, CSV export)                 ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 with tab_estimator:
     st.markdown(
@@ -2793,31 +4293,105 @@ with tab_estimator:
         '<div style="display:flex;align-items:center;gap:12px">'
         '<div style="font-size:28px">🔬</div>'
         '<div>'
-        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Earnings Estimator</div>'
-        '<div style="font-size:10px;color:#6b7099">Weekend research tool — Technical + Fundamental analysis. '
+        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Stock Analysis</div>'
+        '<div style="font-size:10px;color:#6b7099">Technical + Fundamental analysis. '
         'Scan a watchlist for upcoming earnings, get verdicts, valuations, growth & risk flags, and export CSV.</div>'
         '</div></div></div>',
         unsafe_allow_html=True,
     )
 
+    # ── Fetch upcoming earnings from Finnhub ──────────────────────
+    if "finnhub_earnings_tickers" not in st.session_state:
+        st.session_state.finnhub_earnings_tickers = None
+
+    fetch_col1, fetch_col2, fetch_col3 = st.columns([1, 1, 1])
+    with fetch_col1:
+        earn_range = st.selectbox("📅 Earnings window", [
+            "Next week (Mon–Fri)",
+            "This week",
+            "Next 3 days",
+            "Next 7 days",
+            "Next 14 days",
+        ], key="earn_range")
+    with fetch_col2:
+        fetch_earn_btn = st.button("📥 FETCH EARNINGS TICKERS", use_container_width=True, key="btn_fetch_earn")
+    with fetch_col3:
+        clear_earn_btn = st.button("🗑️ Clear", use_container_width=True, key="btn_clear_earn")
+
+    if clear_earn_btn:
+        st.session_state.finnhub_earnings_tickers = None
+        st.rerun()
+
+    if fetch_earn_btn:
+        if not finnhub_api_key or finnhub_api_key.startswith("*"):
+            st.error("Enter your Finnhub API key in the sidebar to fetch earnings tickers.")
+        else:
+            today = date.today()
+            if earn_range == "Next week (Mon–Fri)":
+                # Next Monday
+                days_until_mon = (7 - today.weekday()) % 7
+                if days_until_mon == 0:
+                    days_until_mon = 7
+                from_dt = today + timedelta(days=days_until_mon)
+                to_dt = from_dt + timedelta(days=4)  # Friday
+            elif earn_range == "This week":
+                # This Monday through Friday
+                from_dt = today - timedelta(days=today.weekday())
+                to_dt = from_dt + timedelta(days=4)
+            elif earn_range == "Next 3 days":
+                from_dt = today
+                to_dt = today + timedelta(days=3)
+            elif earn_range == "Next 14 days":
+                from_dt = today
+                to_dt = today + timedelta(days=14)
+            else:  # Next 7 days
+                from_dt = today
+                to_dt = today + timedelta(days=7)
+
+            with st.spinner(f"Fetching earnings {from_dt} → {to_dt} ..."):
+                try:
+                    events = fetch_earnings_calendar_finnhub(finnhub_api_key, from_dt, to_dt)
+                    if events:
+                        st.session_state.finnhub_earnings_tickers = events
+                        st.success(f"Found {len(events)} tickers reporting {from_dt} → {to_dt}")
+                    else:
+                        st.warning("No earnings found for that date range.")
+                        st.session_state.finnhub_earnings_tickers = None
+                except Exception as exc:
+                    st.error(f"Finnhub error: {exc}")
+                    st.session_state.finnhub_earnings_tickers = None
+
+    # Show fetched earnings and let user use them as watchlist
+    fetched_tickers_str = ""
+    if st.session_state.finnhub_earnings_tickers:
+        events = st.session_state.finnhub_earnings_tickers
+        # Build summary table
+        earn_df = pd.DataFrame(events)
+        earn_df["hour"] = earn_df["hour"].replace({"bmo": "Before Open", "amc": "After Close", "dmh": "During Mkt", "": "TBD"})
+        earn_df.columns = ["Ticker", "Date", "Timing", "EPS Est", "Rev Est"]
+        with st.expander(f"📋 {len(events)} Earnings Tickers Fetched — click to view", expanded=False):
+            st.dataframe(earn_df, use_container_width=True, hide_index=True)
+        fetched_tickers_str = ",".join([e["symbol"] for e in events])
+
     ee_col1, ee_col2 = st.columns([3, 1])
     with ee_col1:
         estimator_watchlist_raw = st.text_area(
-            "Tickers to scan (comma-separated)", value=default_watchlist,
+            "Tickers to scan (comma-separated)",
+            value=fetched_tickers_str if fetched_tickers_str else default_watchlist,
             height=80, key="est_watchlist", label_visibility="collapsed",
         )
     with ee_col2:
         earnings_days = st.number_input("Earnings in next N days", min_value=1, max_value=30, value=7, step=1, key="est_days")
 
     estimator_watchlist = [t.strip().upper() for t in estimator_watchlist_raw.strip().split(",") if t.strip()] if estimator_watchlist_raw.strip() else SCAN_WATCHLIST
-    earnings_estimator_btn = st.button("🔬 SCAN EARNINGS", use_container_width=True, type="primary", key="btn_estimator")
+    earnings_estimator_btn = st.button("🔬 SCAN", use_container_width=True, type="primary", key="btn_estimator")
 
     if not earnings_estimator_btn:
         st.markdown(
             '<div style="text-align:center;padding:50px 0">'
             '<div style="font-size:48px;margin-bottom:12px;opacity:.2">🔬</div>'
             '<div style="color:#6b7099;font-size:13px">Paste tickers above and click '
-            '<b style="color:#4d9fff">🔬 SCAN EARNINGS</b> for fundamental + technical verdicts</div>'
+            '<b style="color:#4d9fff">🔬 SCAN</b> for fundamental + technical verdicts</div>'
             '<div style="color:#3a3d5c;font-size:10px;margin-top:8px">'
             'Includes: P/E valuation · analyst targets · sector · growth flags · entry/stop/target levels</div>'
             '</div>',
@@ -2868,40 +4442,95 @@ with tab_sector:
                 )
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║ TAB 4: TECHNICAL SCANNER (Scan Bullish/Bearish — pure technical)            ║
+# ║ TAB 4: BACKTEST (Walk-forward estimator signal backtest)                     ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-with tab_scanner:
+with tab_backtest:
     st.markdown(
         '<div style="background:linear-gradient(135deg,#0a0b14,#131625);border:1px solid #1a1d2e;'
         'border-radius:8px;padding:18px 24px;margin-bottom:16px">'
         '<div style="display:flex;align-items:center;gap:12px">'
-        '<div style="font-size:28px">🔍</div>'
+        '<div style="font-size:28px">📊</div>'
         '<div>'
-        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Technical Scanner</div>'
-        '<div style="font-size:10px;color:#6b7099">Pure technical scan — 4H candle, Fibonacci, '
-        'options flow, Weinstein stage. Find high-confidence LONG and SHORT setups.</div>'
+        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Backtest</div>'
+        '<div style="font-size:10px;color:#6b7099">Walk-forward backtest — replays Fib + Volume Profile + Daily Candle signals '
+        'on historical data. Enter a ticker, set hold period, and test signal accuracy.</div>'
         '</div></div></div>',
         unsafe_allow_html=True,
     )
 
-    sc_col1, sc_col2 = st.columns([3, 1])
-    with sc_col1:
-        custom_watchlist_raw = st.text_area(
-            "Watchlist (comma-separated)", value=default_watchlist,
-            height=80, key="scan_watchlist", label_visibility="collapsed",
-        )
-    with sc_col2:
-        scan_date = st.date_input("Scan Date", value=date.today(), key="scan_date")
+    bt_col1, bt_col2, bt_col3 = st.columns([2, 1, 1])
+    with bt_col1:
+        bt_ticker = st.text_input("Backtest ticker", value="SPY", key="bt_est_ticker").upper().strip()
+    with bt_col2:
+        bt_years = st.number_input("Years of data", min_value=1, max_value=5, value=2, step=1, key="bt_est_years")
+    with bt_col3:
+        bt_use_dynamic = st.toggle("Use ATR target days", value=True, key="bt_dynamic_hold",
+                                    help="ON = each trade uses the ATR-based target days from the signal (same as live scanner). "
+                                         "OFF = use fixed hold period for all trades.")
+    if not bt_use_dynamic:
+        bt_hold = st.number_input("Fixed hold days", min_value=1, max_value=20, value=5, step=1, key="bt_est_hold")
+    else:
+        bt_hold = 5  # unused when dynamic
+    bt_best_only = st.toggle("Best Setup only (Y)", value=False, key="bt_best_only",
+                              help="Only take trades where Best Setup = Y (all signals aligned)")
+    bt_run = st.button("▶ RUN BACKTEST", use_container_width=True, type="primary", key="btn_bt_est")
 
-    custom_watchlist = [t.strip().upper() for t in custom_watchlist_raw.split(",") if t.strip()] if custom_watchlist_raw.strip() else SCAN_WATCHLIST
-    scan_btn = st.button("🔍 SCAN BULLISH & BEARISH", use_container_width=True, type="primary", key="btn_scan")
+    # ── Date Lookup ──────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<div style="font-size:12px;font-weight:700;color:#e8ecff;margin-bottom:8px">📅 Date Lookup</div>'
+        '<div style="font-size:10px;color:#6b7099;margin-bottom:12px">'
+        'Enter a date to see the estimator signal snapshot for that day.</div>',
+        unsafe_allow_html=True,
+    )
+    dl_col1, dl_col2 = st.columns([2, 1])
+    with dl_col1:
+        dl_ticker = st.text_input("Lookup ticker", value="SPY", key="dl_ticker").upper().strip()
+    with dl_col2:
+        dl_date = st.date_input("Lookup date", value=date.today(), key="dl_date")
+    dl_run = st.button("📅 LOOKUP DATE", use_container_width=True, key="btn_dl_date")
 
-    if not scan_btn:
+    if not bt_run and not dl_run:
         st.markdown(
             '<div style="text-align:center;padding:50px 0">'
-            '<div style="font-size:48px;margin-bottom:12px;opacity:.2">🔍</div>'
-            '<div style="color:#6b7099;font-size:13px">Edit the watchlist above and click '
-            '<b style="color:#4d9fff">🔍 SCAN</b> for bullish & bearish setups</div>'
+            '<div style="font-size:48px;margin-bottom:12px;opacity:.2">📊</div>'
+            '<div style="color:#6b7099;font-size:13px">Enter a ticker above and click '
+            '<b style="color:#4d9fff">▶ RUN BACKTEST</b> to test estimator signals</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ TAB: INTRADAY PLANNING                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+with tab_plan:
+    st.markdown(
+        '<div style="background:linear-gradient(135deg,#0a0b14,#131625);border:1px solid #1a1d2e;'
+        'border-radius:8px;padding:18px 24px;margin-bottom:16px">'
+        '<div style="display:flex;align-items:center;gap:12px">'
+        '<div style="font-size:28px">🗓️</div>'
+        '<div>'
+        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Intraday Planning</div>'
+        '<div style="font-size:10px;color:#6b7099">Run after market close — generates a trade plan for '
+        'tomorrow based on today\'s signals. Shows direction, entry, stop, targets, and what to do at the open.<br>'
+        'Use <b>Check Open Prices</b> the next morning to see which scenario played out.</div>'
+        '</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    plan_tickers_raw = st.text_area(
+        "Tickers (comma-separated)", value="SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, META, GOOG",
+        height=60, key="plan_tickers", label_visibility="collapsed",
+    )
+    plan_date = st.date_input("Plan date (close of this day)", value=date.today(), key="plan_date")
+    plan_run = st.button("🗓️ GENERATE PLAN", use_container_width=True, type="primary", key="btn_plan")
+    check_open_run = st.button("☀️ CHECK OPEN PRICES", use_container_width=True, key="btn_check_open")
+
+    if not plan_run and not check_open_run:
+        st.markdown(
+            '<div style="text-align:center;padding:50px 0">'
+            '<div style="font-size:48px;margin-bottom:12px;opacity:.2">🗓️</div>'
+            '<div style="color:#6b7099;font-size:13px">Enter tickers, pick a date, and click '
+            '<b style="color:#4d9fff">🗓️ GENERATE PLAN</b> to create your intraday trade plan</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -2911,61 +4540,100 @@ with tab_scanner:
 # BUTTON HANDLERS — each runs inside its tab
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Earnings Estimator ──────────────────────────
+# ── Stock Analysis ──────────────────────────
 if earnings_estimator_btn:
   with tab_estimator:
-    st.markdown(f"### � Earnings Estimator — Scanning {len(estimator_watchlist)} Tickers")
+    st.markdown(f"### 🔬 Stock Analysis — Scanning {len(estimator_watchlist)} Tickers")
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(estimator_watchlist)
 
-    scan_results = []
+    scan_results  = []      # all tickers with signals
+    scan_errors   = []      # hard errors (API failures etc.)
+    scan_no_data  = []      # tickers that returned no data (timeout, bad ticker, etc.)
     for i, ticker in enumerate(estimator_watchlist):
         status_text.text(f"Analyzing {ticker}... ({i+1}/{total})")
         progress_bar.progress((i + 1) / total)
-        result = scan_single_stock(ticker, api_key, api_secret, data_source, use_fib, fib_tol, use_strategy)
-        if result:
-            # Get fundamentals for extra context
-            fundies = get_fundamentals(ticker)
-            if fundies:
-                result["sector"] = fundies.get("sector", "N/A")
-                result["industry"] = fundies.get("industry", "N/A")
-                result["pe_ratio"] = fundies.get("pe_ratio")
-                result["forward_pe"] = fundies.get("forward_pe")
-                result["peg_ratio"] = fundies.get("peg_ratio")
-                result["analyst_target"] = fundies.get("target_price")
-                result["revenue_growth"] = fundies.get("revenue_growth")
-                result["earnings_growth"] = fundies.get("earnings_growth")
-                result["profit_margin"] = fundies.get("profit_margin")
-                result["roe"] = fundies.get("roe")
-                result["debt_to_equity"] = fundies.get("debt_to_equity")
-                result["beta"] = fundies.get("beta")
-                result["dividend_yield"] = fundies.get("dividend_yield")
-                result["short_pct"] = fundies.get("short_pct")
-                result["week52_position"] = fundies.get("week52_position")
-                result["pct_from_high"] = fundies.get("pct_from_high")
-                result["rec_key"] = fundies.get("rec_key", "")
-                result["num_analysts"] = fundies.get("num_analysts")
-                result["revenue_str"] = fundies.get("revenue_str", "N/A")
-                # Build a quick flags summary string
-                flags = fundies.get("flags", [])
-                result["flags"] = " · ".join(f[0] for f in flags) if flags else ""
+        try:
+            result = scan_single_stock(ticker, api_key, api_secret, data_source, use_fib, fib_tol, use_strategy)
+            if result:
+                fundies = get_fundamentals(ticker)
+                if fundies:
+                    result["sector"]          = fundies.get("sector", "N/A")
+                    result["industry"]        = fundies.get("industry", "N/A")
+                    result["pe_ratio"]        = fundies.get("pe_ratio")
+                    result["forward_pe"]      = fundies.get("forward_pe")
+                    result["peg_ratio"]       = fundies.get("peg_ratio")
+                    result["analyst_target"]  = fundies.get("target_price")
+                    result["revenue_growth"]  = fundies.get("revenue_growth")
+                    result["earnings_growth"] = fundies.get("earnings_growth")
+                    result["profit_margin"]   = fundies.get("profit_margin")
+                    result["roe"]             = fundies.get("roe")
+                    result["debt_to_equity"]  = fundies.get("debt_to_equity")
+                    result["beta"]            = fundies.get("beta")
+                    result["dividend_yield"]  = fundies.get("dividend_yield")
+                    result["short_pct"]       = fundies.get("short_pct")
+                    result["week52_position"] = fundies.get("week52_position")
+                    result["pct_from_high"]   = fundies.get("pct_from_high")
+                    result["rec_key"]         = fundies.get("rec_key", "")
+                    result["num_analysts"]    = fundies.get("num_analysts")
+                    result["revenue_str"]     = fundies.get("revenue_str", "N/A")
+                    flags = fundies.get("flags", [])
+                    result["flags"]           = " · ".join(f[0] for f in flags) if flags else ""
+                else:
+                    result["sector"] = "N/A"; result["industry"] = "N/A"; result["flags"] = ""
+                scan_results.append(result)
             else:
-                result["sector"] = "N/A"
-                result["industry"] = "N/A"
-                result["flags"] = ""
-            scan_results.append(result)
+                # scan_single_stock returned None — no data / insufficient bars
+                scan_no_data.append(ticker)
+        except Exception as e:
+            err_str = str(e)
+            # Classify: timeout vs other error
+            is_timeout = any(kw in err_str.lower() for kw in
+                             ("timeout", "timed out", "read timed", "connectionerror",
+                              "connection reset", "remotedisconnected", "connection aborted"))
+            scan_errors.append((ticker, err_str, is_timeout))
     progress_bar.empty()
     status_text.empty()
 
+    # ── Timeout / no-data tickers — copy-ready for retry ──────────────────
+    timeout_tickers = [t for t, _, is_to in scan_errors if is_to]
+    other_errors    = [(t, e) for t, e, is_to in scan_errors if not is_to]
+    all_failed      = timeout_tickers + scan_no_data
+
+    if all_failed:
+        failed_csv = ", ".join(all_failed)
+        st.warning(
+            f"**{len(all_failed)} ticker(s) returned no data** "
+            f"({len(timeout_tickers)} timeout, {len(scan_no_data)} no data). "
+            f"Copy below and re-run them individually:"
+        )
+        st.code(failed_csv, language=None)
+
+    if other_errors:
+        with st.expander(f"⚠️ {len(other_errors)} other error(s)"):
+            for t, err in other_errors[:10]:
+                st.code(f"{t}: {err}", language=None)
+            if len(other_errors) > 10:
+                st.caption(f"...and {len(other_errors)-10} more")
+
     if scan_results:
         import pandas as pd
-        df = pd.DataFrame(scan_results)
+        df_all = pd.DataFrame(scan_results)
 
-        # Format display columns — full fundamental + technical view
+        # Split: actionable (ENTER) vs filtered
+        actionable = df_all[df_all["entry_status"] == "ENTER"].copy()
+        filtered   = df_all[df_all["entry_status"] != "ENTER"].copy()
+
+        # Format display columns — entry_status first, then grade, then signals
         display_cols = [
-            "ticker", "price", "sector", "industry", "verdict", "confidence", "score",
-            "entry", "stop_loss", "target1", "target2", "t1_days",
+            "ticker", "price", "entry_status", "entry_grade", "entry_label",
+            "expected_wr", "expected_avg",
+            "weekly_bias", "daily_bias", "4h_bias", "mtf_signal", "mtf_action",
+            "sector", "verdict", "confidence", "score", "best_setup",
+            "candle", "vol_action", "vol_trend", "vol_ratio", "poc", "val", "vah",
+            "persistence", "quote_type",
+            "entry", "stop_loss", "target1", "target2", "t1_days", "risk_pct",
             "pe_ratio", "forward_pe", "peg_ratio", "valuation", "market_cap",
             "revenue_str", "revenue_growth", "earnings_growth",
             "profit_margin", "roe", "debt_to_equity", "beta",
@@ -2975,34 +4643,63 @@ if earnings_estimator_btn:
             "week52_position", "pct_from_high",
             "flags",
         ]
-        display_cols = [c for c in display_cols if c in df.columns]
+        display_cols = [c for c in display_cols if c in df_all.columns]
 
-        # Format columns for readability
-        for col in ["target_1y", "analyst_target"]:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: f"${x}" if pd.notnull(x) and x else "N/A")
-        if "target_upside" in df.columns:
-            df["target_upside"] = df["target_upside"].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) and x != "" else "")
-        if "pe_ratio" in df.columns:
-            df["pe_ratio"] = df["pe_ratio"].apply(lambda x: f"{x:.1f}" if pd.notnull(x) and x else "N/A")
-        if "forward_pe" in df.columns:
-            df["forward_pe"] = df["forward_pe"].apply(lambda x: f"{x:.1f}" if pd.notnull(x) and x else "N/A")
-        if "peg_ratio" in df.columns:
-            df["peg_ratio"] = df["peg_ratio"].apply(lambda x: f"{x:.2f}" if pd.notnull(x) and x else "N/A")
-        for pct_col in ["revenue_growth", "earnings_growth", "profit_margin", "roe", "dividend_yield", "short_pct"]:
-            if pct_col in df.columns:
-                df[pct_col] = df[pct_col].apply(lambda x: f"{x*100:.1f}%" if pd.notnull(x) and x != "" else "N/A")
-        if "debt_to_equity" in df.columns:
-            df["debt_to_equity"] = df["debt_to_equity"].apply(lambda x: f"{x:.0f}" if pd.notnull(x) and x != "" else "N/A")
-        if "beta" in df.columns:
-            df["beta"] = df["beta"].apply(lambda x: f"{x:.2f}" if pd.notnull(x) and x != "" else "N/A")
-        if "week52_position" in df.columns:
-            df["week52_position"] = df["week52_position"].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) and x != "" else "N/A")
-        if "pct_from_high" in df.columns:
-            df["pct_from_high"] = df["pct_from_high"].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) and x != "" else "N/A")
+        def _format_df(df):
+            df = df.copy()
+            for col in ["target_1y", "analyst_target"]:
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: f"${x}" if pd.notnull(x) and x else "N/A")
+            if "target_upside" in df.columns:
+                df["target_upside"] = df["target_upside"].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) and x != "" else "")
+            for c in ["pe_ratio", "forward_pe"]:
+                if c in df.columns:
+                    df[c] = df[c].apply(lambda x: f"{x:.1f}" if pd.notnull(x) and x else "N/A")
+            if "peg_ratio" in df.columns:
+                df["peg_ratio"] = df["peg_ratio"].apply(lambda x: f"{x:.2f}" if pd.notnull(x) and x else "N/A")
+            for pct_col in ["revenue_growth", "earnings_growth", "profit_margin", "roe", "dividend_yield", "short_pct"]:
+                if pct_col in df.columns:
+                    df[pct_col] = df[pct_col].apply(lambda x: f"{x*100:.1f}%" if pd.notnull(x) and x != "" else "N/A")
+            if "debt_to_equity" in df.columns:
+                df["debt_to_equity"] = df["debt_to_equity"].apply(lambda x: f"{x:.0f}" if pd.notnull(x) and x != "" else "N/A")
+            if "beta" in df.columns:
+                df["beta"] = df["beta"].apply(lambda x: f"{x:.2f}" if pd.notnull(x) and x != "" else "N/A")
+            if "week52_position" in df.columns:
+                df["week52_position"] = df["week52_position"].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) and x != "" else "N/A")
+            if "pct_from_high" in df.columns:
+                df["pct_from_high"] = df["pct_from_high"].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) and x != "" else "N/A")
+            for vcol in ["poc", "val", "vah"]:
+                if vcol in df.columns:
+                    df[vcol] = df[vcol].apply(lambda x: f"${x:.2f}" if pd.notnull(x) and x else "")
+            if "vol_ratio" in df.columns:
+                df["vol_ratio"] = df["vol_ratio"].apply(lambda x: f"{x:.1f}x" if pd.notnull(x) and x else "")
+            if "expected_wr" in df.columns:
+                df["expected_wr"] = df["expected_wr"].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) else "")
+            if "expected_avg" in df.columns:
+                df["expected_avg"] = df["expected_avg"].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "")
+            if "risk_pct" in df.columns:
+                df["risk_pct"] = df["risk_pct"].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) and x else "")
+            if "persistence" in df.columns:
+                df["persistence"] = df["persistence"].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) else "")
+            return df
 
-        # Rename columns for cleaner headers
         col_rename = {
+            "entry_status": "Status",
+            "entry_grade":  "Grade",
+            "entry_label":  "Entry Signal",
+            "expected_wr":  "Exp WR%",
+            "expected_avg": "Exp Avg P&L",
+            "weekly_bias":  "Weekly",
+            "daily_bias":   "Daily",
+            "4h_bias":      "4H",
+            "mtf_signal":   "Signal",
+            "mtf_action":   "Action",
+            "candle":       "Day Candle",
+            "persistence":  "Trend Pers%",
+            "quote_type":   "Type",
+            "best_setup":   "Best Setup",
+            "vol_action":   "Vol Bias", "vol_trend": "Vol Trend", "vol_ratio": "Vol Ratio",
+            "poc": "POC", "val": "VAL", "vah": "VAH",
             "pe_ratio": "P/E", "forward_pe": "Fwd P/E", "peg_ratio": "PEG",
             "revenue_str": "Revenue", "revenue_growth": "Rev Growth",
             "earnings_growth": "EPS Growth", "profit_margin": "Margin",
@@ -3012,20 +4709,57 @@ if earnings_estimator_btn:
             "target_upside": "Upside", "rec_key": "Rating",
             "num_analysts": "# Analysts", "week52_position": "52W Pos",
             "pct_from_high": "vs 52W Hi", "market_cap": "Mkt Cap",
-            "stop_loss": "Stop", "t1_days": "T1 Days", "flags": "Signals",
+            "stop_loss": "Stop", "t1_days": "T1 (td)", "risk_pct": "Risk%", "flags": "Signals",
         }
-        df_display = df[display_cols].rename(columns=col_rename)
 
-        # Summary counts
-        bullish_count = sum(1 for r in scan_results if r.get("verdict") == "BULLISH")
-        bearish_count = sum(1 for r in scan_results if r.get("verdict") == "BEARISH")
-        high_conf = sum(1 for r in scan_results if r.get("confidence") == "HIGH")
+        # ── Color styling for Weekly / Daily / 4H / Signal columns ───────
+        _bias_cols = {"Weekly", "Daily", "4H"}
+        def _style_bias_cols(df):
+            """Return a Styler with green/red/grey on bias cols + signal col."""
+            def _color_bias(val):
+                if not isinstance(val, str):
+                    return ""
+                v = val.upper()
+                if "BULLISH" in v:
+                    return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+                elif "BEARISH" in v:
+                    return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+                return "background-color: #1a1d2e; color: #6b7099"
+            def _color_signal(val):
+                if not isinstance(val, str):
+                    return ""
+                v = val.upper()
+                if "A+ LONG" in v or "STRONG LONG" in v or "LONG PULLBACK" in v:
+                    return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+                elif "A+ SHORT" in v or "STRONG SHORT" in v or "SHORT PULLBACK" in v:
+                    return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+                elif "SHORT-TERM LONG" in v:
+                    return "color: #00e5a0; font-weight: 600"
+                elif "SHORT-TERM SHORT" in v:
+                    return "color: #ff4d6a; font-weight: 600"
+                elif "NO EDGE" in v or "NOISE" in v or "TOO EARLY" in v:
+                    return "color: #6b7099"
+                elif "WARNING" in v or "DEAD CAT" in v or "FAILING" in v:
+                    return "color: #f0c040; font-weight: 600"
+                return "color: #a78bfa"
+            bias_present = [c for c in _bias_cols if c in df.columns]
+            styler = df.style.applymap(_color_bias, subset=bias_present)
+            if "Signal" in df.columns:
+                styler = styler.applymap(_color_signal, subset=["Signal"])
+            return styler
 
-        # Sector breakdown
+        # ── Summary banner ──────────────────────────────────────────────────
+        enter_results  = [r for r in scan_results if r.get("entry_status") == "ENTER"]
+        grade_s  = sum(1 for r in enter_results if r.get("entry_grade") == "S")
+        grade_a  = sum(1 for r in enter_results if r.get("entry_grade") == "A")
+        grade_b  = sum(1 for r in enter_results if r.get("entry_grade") in ("B","B-"))
+        grade_c  = sum(1 for r in enter_results if r.get("entry_grade") == "C")
+        bullish_count = sum(1 for r in enter_results if r.get("verdict") == "BULLISH")
+        bearish_count = sum(1 for r in enter_results if r.get("verdict") == "BEARISH")
+        high_conf     = sum(1 for r in enter_results if r.get("confidence") == "HIGH")
         sector_counts = {}
-        for r in scan_results:
-            s = r.get("sector", "N/A")
-            sector_counts[s] = sector_counts.get(s, 0) + 1
+        for r in enter_results:
+            s = r.get("sector","N/A"); sector_counts[s] = sector_counts.get(s,0)+1
         sector_summary = " · ".join(f"{s}: {c}" for s, c in sorted(sector_counts.items(), key=lambda x: -x[1])[:6])
 
         st.markdown(
@@ -3033,139 +4767,1176 @@ if earnings_estimator_btn:
             f'<span style="color:#6b7099;font-size:11px">Scanned <b style="color:#e8ecff">{total}</b> tickers · '
             f'<b style="color:#00e5a0">{bullish_count}</b> bullish · '
             f'<b style="color:#ff4d6a">{bearish_count}</b> bearish · '
-            f'<b style="color:#4d9fff">{high_conf}</b> high confidence</span><br>'
+            f'<b style="color:#4d9fff">{high_conf}</b> high confidence · '
+            f'<b style="color:#e8ecff">{len(enter_results)}</b> actionable / {len(scan_results)} total</span><br>'
+            f'<span style="color:#6b7099;font-size:11px">Entry grades (actionable): '
+            f'<b style="color:#00e5a0">S: {grade_s}</b> · <b style="color:#00e5a0">A: {grade_a}</b> · '
+            f'<b style="color:#4d9fff">B: {grade_b}</b> · <b style="color:#f0c040">C: {grade_c}</b></span><br>'
             f'<span style="color:#3a3d5c;font-size:10px">Sectors: {sector_summary}</span></div>',
             unsafe_allow_html=True,
         )
 
-        st.dataframe(df_display, use_container_width=True, height=min(40 * len(df_display) + 38, 600))
+        # ── Split by MTF rank into separate tables ──────────────────────
+        # Add mtf_rank to df_all for splitting
+        if "mtf_rank" not in df_all.columns:
+            df_all["mtf_rank"] = 5
 
-        # CSV download
-        csv_data = df_display.to_csv(index=False)
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv_data,
-            file_name=f"earnings_estimator_{date.today()}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        # Rank labels & icons
+        _rank_meta = {
+            1: ("🎯 Rank 1 — All Timeframes Aligned", "#00e5a0"),
+            2: ("✅ Rank 2 — Two Aligned + Neutral", "#4d9fff"),
+            3: ("⚠️ Rank 3 — Conflicting Signals", "#f0c040"),
+            4: ("📋 Rank 4 — Weak / Mixed", "#a78bfa"),
+            5: ("⬜ Rank 5 — No Edge", "#6b7099"),
+        }
+
+        # Tabs: Rank 1, Rank 2, All (ranked)
+        r1_df = actionable[actionable["mtf_rank"] == 1] if not actionable.empty else pd.DataFrame()
+        r2_df = actionable[actionable["mtf_rank"] == 2] if not actionable.empty else pd.DataFrame()
+        rest_df = actionable[actionable["mtf_rank"] >= 3] if not actionable.empty else pd.DataFrame()
+
+        view_tab1, view_tab2, view_tab3, view_tab4 = st.tabs([
+            f"🎯 Rank 1 — Full Align ({len(r1_df)})",
+            f"✅ Rank 2 — Two Aligned ({len(r2_df)})",
+            f"📋 Rank 3+ — Rest ({len(rest_df)})",
+            f"📊 All Tickers ({len(df_all)})",
+        ])
+
+        def _render_rank_table(df_subset, tab_container, rank_label, rank_color, empty_msg):
+            with tab_container:
+                if df_subset.empty:
+                    st.info(empty_msg)
+                    return
+                st.markdown(
+                    f'<div style="border-left:4px solid {rank_color};padding:4px 12px;margin-bottom:10px">'
+                    f'<span style="color:{rank_color};font-weight:700;font-size:14px">{rank_label}</span></div>',
+                    unsafe_allow_html=True,
+                )
+                cols_r = [c for c in display_cols if c in df_subset.columns]
+                df_r = _format_df(df_subset)[cols_r].rename(columns=col_rename)
+                df_r = df_r.sort_values(by="score", ascending=False, key=lambda s: s.abs()) if "score" in df_r.columns else df_r
+                st.dataframe(_style_bias_cols(df_r), use_container_width=True, height=min(40*len(df_r)+38, 600))
+                st.download_button(
+                    f"📥 Download {rank_label} CSV", df_r.to_csv(index=False),
+                    file_name=f"scan_rank_{rank_label[:6].strip()}_{date.today()}.csv",
+                    mime="text/csv", use_container_width=True,
+                    key=f"dl_{rank_label[:6]}")
+
+        _render_rank_table(r1_df, view_tab1, *_rank_meta[1], "No Rank 1 setups (all 3 TFs aligned) found today.")
+        _render_rank_table(r2_df, view_tab2, *_rank_meta[2], "No Rank 2 setups (2 TFs aligned) found today.")
+
+        # Rank 3+ sorted by rank then score
+        with view_tab3:
+            if rest_df.empty:
+                st.info("No additional actionable setups.")
+            else:
+                for rank_val in sorted(rest_df["mtf_rank"].unique()):
+                    r_sub = rest_df[rest_df["mtf_rank"] == rank_val]
+                    label, color = _rank_meta.get(rank_val, (f"Rank {rank_val}", "#6b7099"))
+                    st.markdown(
+                        f'<div style="border-left:4px solid {color};padding:4px 12px;margin:12px 0 6px">'
+                        f'<span style="color:{color};font-weight:700;font-size:13px">{label} ({len(r_sub)})</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                    cols_r = [c for c in display_cols if c in r_sub.columns]
+                    df_r = _format_df(r_sub)[cols_r].rename(columns=col_rename)
+                    df_r = df_r.sort_values(by="score", ascending=False, key=lambda s: s.abs()) if "score" in df_r.columns else df_r
+                    st.dataframe(_style_bias_cols(df_r), use_container_width=True, height=min(40*len(df_r)+38, 400))
+
+        # All tickers tab (unchanged)
+        with view_tab4:
+            st.caption("All tickers including filtered ones. Status column shows why each was skipped.")
+            cols_all = [c for c in display_cols if c in df_all.columns]
+            df_show  = _format_df(df_all)[cols_all].rename(columns=col_rename)
+            df_show = df_show.sort_values(
+                by=["Status", col_rename.get("score","score")],
+                ascending=[True, False],
+                key=lambda col: col.map(lambda x: (0 if x=="ENTER" else 1) if col.name=="Status" else x)
+                    if col.name == "Status" else col.abs() if col.name == col_rename.get("score","score") else col
+            ) if "Status" in df_show.columns else df_show
+            st.dataframe(_style_bias_cols(df_show), use_container_width=True, height=min(40*len(df_show)+38, 700))
+            st.download_button("📥 Download Full CSV", df_show.to_csv(index=False),
+                file_name=f"scan_all_{date.today()}.csv", mime="text/csv",
+                use_container_width=True)
+
+        # ── Sector Strength (from scan results) ────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📊 Sector Strength — from this scan")
+        sector_str = _sector_strength_from_scan(scan_results)
+        if sector_str:
+            # Bar chart
+            sec_names  = [s["sector"] for s in sector_str]
+            sec_scores = [s["avg_score"] for s in sector_str]
+            bar_colors = ["#00e5a0" if v > 0 else "#ff4d6a" for v in sec_scores]
+
+            bar_html = ""
+            max_abs  = max(abs(v) for v in sec_scores) or 1
+            for s in sector_str:
+                sc    = s["avg_score"]
+                pct   = abs(sc) / max_abs * 100
+                col   = "#00e5a0" if sc > 0 else ("#ff4d6a" if sc < 0 else "#6b7099")
+                bias_icon = "🟢" if s["bias"]=="BULLISH" else ("🔴" if s["bias"]=="BEARISH" else "⚪")
+                bar_html += (
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">'
+                    f'<div style="width:130px;font-size:11px;color:#e8ecff;text-align:right;flex-shrink:0">'
+                    f'{bias_icon} {s["sector"][:18]}</div>'
+                    f'<div style="flex:1;background:#1a1d2e;border-radius:3px;height:16px;position:relative">'
+                    f'<div style="width:{pct:.0f}%;background:{col};height:100%;border-radius:3px"></div>'
+                    f'</div>'
+                    f'<div style="width:80px;font-size:10px;color:{col};flex-shrink:0">'
+                    f'avg {sc:+.2f} · {s["total"]}T</div>'
+                    f'</div>'
+                )
+            st.markdown(f'<div style="padding:8px 0">{bar_html}</div>', unsafe_allow_html=True)
+
+            # Top 3 strongest / weakest
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Strongest sectors**")
+                for s in sector_str[:3]:
+                    st.markdown(f"🟢 **{s['sector']}** — avg score {s['avg_score']:+.2f}, {s['bull_pct']:.0f}% bullish")
+            with c2:
+                st.markdown("**Weakest sectors**")
+                for s in reversed(sector_str[-3:]):
+                    st.markdown(f"🔴 **{s['sector']}** — avg score {s['avg_score']:+.2f}, {s['bearish']}/{s['total']} bearish")
+
+        # Save scan results to session state so Macro tab can read them
+        st.session_state["_last_scan_results"] = scan_results
     else:
         st.info("No scan results returned. Check that your API keys are valid and tickers are correct.")
 
-# ── Scan for bullish stocks ──────────────────────────
-if scan_btn:
-  with tab_scanner:
-    st.markdown(f"### 🔍 Scanning for Bullish Setups on {scan_date}...")
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    top_bullish = []
-    all_results = []
-    total = len(custom_watchlist)
-    for i, ticker in enumerate(custom_watchlist):
-        status_text.text(f"Scanning {ticker}... ({i+1}/{total})")
-        progress_bar.progress((i + 1) / total)
-        # Pass scan_date to scan_single_stock if needed, or use in logic
-        # For now, scan_single_stock uses current date, but you can extend it to use scan_date
-        result = scan_single_stock(ticker, api_key, api_secret, data_source, use_fib, fib_tol, use_strategy)
-        if result:
-            all_results.append(result)
-    progress_bar.empty()
-    status_text.empty()
-    top_bullish = [r for r in all_results if r["verdict"] == "BULLISH" and r["confidence"] == "HIGH"]
-    top_bullish.sort(key=lambda x: x["score"], reverse=True)
-    top_bullish = top_bullish[:5]
-    top_bearish = [r for r in all_results if r["verdict"] == "BEARISH" and r["confidence"] == "HIGH"]
-    top_bearish.sort(key=lambda x: x["score"])
-    top_bearish = top_bearish[:5]
+# ── Backtest Estimator Signals ──────────────────────────
+if bt_run:
+  with tab_backtest:
+    if missing_creds:
+        st.error("Enter API credentials in the sidebar first.")
+    elif not bt_ticker:
+        st.warning("Enter a ticker to backtest.")
+    else:
+        with st.spinner(f"Backtesting {bt_ticker} — {bt_years}yr, {'ATR target days' if bt_use_dynamic else f'hold {bt_hold}d'} ..."):
+            bt_end = date.today()
+            bt_start = bt_end - timedelta(days=bt_years * 365)
+            try:
+                if data_source == "Alpaca":
+                    bt_daily = get_daily_bars_alpaca(bt_ticker, str(bt_start), str(bt_end), api_key, api_secret)
+                else:
+                    bt_daily = get_daily_bars(bt_ticker, str(bt_start), str(bt_end), api_key)
+
+                if bt_daily is None or bt_daily.empty or len(bt_daily) < 80:
+                    st.warning(f"Not enough data for {bt_ticker} ({len(bt_daily) if bt_daily is not None else 0} bars).")
+                else:
+                    # ── Instrument suitability check ──────────────────────────
+                    supported, reason = _is_instrument_supported(bt_ticker, bt_daily)
+                    if not supported:
+                        st.warning(
+                            f"⚠️ **{bt_ticker} is not supported by this model.**\n\n"
+                            f"{reason}\n\n"
+                            f"The backtest will run but results are expected to be unreliable. "
+                            f"Trend-following signals have no demonstrated edge on this instrument."
+                        )
+
+                    bt_results = backtest_estimator(
+                        bt_daily, use_fib=use_fib, fib_tol=fib_tol,
+                        hold_days=bt_hold, filter_best_only=bt_best_only,
+                        use_dynamic_hold=bt_use_dynamic,
+                        ticker=bt_ticker,
+                    )
+                    if bt_results.empty:
+                        st.info("No signals generated during the backtest period.")
+                    else:
+                        # Stats
+                        n_trades = len(bt_results)
+                        wins = bt_results[bt_results["win"]]
+                        losses = bt_results[~bt_results["win"]]
+                        win_rate = len(wins) / n_trades * 100
+                        avg_pnl = bt_results["pnl_pct"].mean()
+                        total_pnl = bt_results["pnl_pct"].sum()
+                        avg_win = wins["pnl_pct"].mean() if len(wins) else 0
+                        avg_loss = losses["pnl_pct"].mean() if len(losses) else 0
+                        pf = abs(len(wins) * avg_win / (len(losses) * avg_loss)) if len(losses) and avg_loss else None
+                        best_only_ct = (bt_results["best_setup"] == "Y").sum()
+
+                        # Equity curve
+                        equity = [100.0]
+                        for p in bt_results["pnl_pct"].values:
+                            equity.append(round(equity[-1] * (1 + p / 100), 2))
+                        max_dd = 0
+                        peak = 100.0
+                        for e in equity:
+                            if e > peak:
+                                peak = e
+                            dd = (peak - e) / peak * 100
+                            if dd > max_dd:
+                                max_dd = dd
+
+                        # Summary metrics
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Trades", n_trades)
+                        m2.metric("Win Rate", f"{win_rate:.1f}%")
+                        m3.metric("Total P&L", f"{total_pnl:+.1f}%")
+                        m4.metric("Max Drawdown", f"{max_dd:.1f}%")
+
+                        m5, m6, m7, m8 = st.columns(4)
+                        m5.metric("Avg Trade", f"{avg_pnl:+.2f}%")
+                        m6.metric("Avg Win", f"{avg_win:+.2f}%")
+                        m7.metric("Avg Loss", f"{avg_loss:+.2f}%")
+                        m8.metric("Profit Factor", f"{pf:.2f}" if pf and pf != float("inf") else "∞")
+
+                        if best_only_ct > 0 and not bt_best_only:
+                            best_df = bt_results[bt_results["best_setup"] == "Y"]
+                            best_wr = len(best_df[best_df["win"]]) / len(best_df) * 100 if len(best_df) else 0
+                            st.info(f"💡 Best Setup trades: {best_only_ct}/{n_trades} — Win Rate: {best_wr:.0f}%")
+
+                        # ── Backtest-derived grade reference ──────────────────
+                        grade_rows = []
+                        for (sc, cf), (gr, lbl, exp_wr, exp_avg, col) in ENTRY_GRADE_TABLE.items():
+                            sub = bt_results[
+                                (bt_results["score"].abs() == sc) &
+                                (bt_results["confidence"] == cf)
+                            ]
+                            if len(sub) > 0:
+                                actual_wr  = sub["win"].mean() * 100
+                                actual_avg = sub["pnl_pct"].mean()
+                                grade_rows.append({
+                                    "Grade": gr,
+                                    "Score": f"±{sc}",
+                                    "Conf": cf,
+                                    "Trades": len(sub),
+                                    "Actual WR%": f"{actual_wr:.0f}%",
+                                    "Actual Avg": f"{actual_avg:+.2f}%",
+                                    "Model Exp WR%": f"{exp_wr}%",
+                                    "Model Exp Avg": f"{exp_avg:+.2f}%",
+                                })
+                        if grade_rows:
+                            st.markdown(
+                                '<div style="font-size:11px;color:#6b7099;margin:10px 0 4px">📊 '
+                                '<b style="color:#e8ecff">Entry grade breakdown</b> — '
+                                'Actual results vs model expectations from SPY backtest</div>',
+                                unsafe_allow_html=True,
+                            )
+                            st.dataframe(
+                                pd.DataFrame(grade_rows),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                        # Equity curve chart
+                        eq_fig = go.Figure()
+                        eq_fig.add_trace(go.Scatter(
+                            y=equity, mode="lines",
+                            line=dict(color="#00e5a0" if equity[-1] >= 100 else "#ff4d6a", width=2),
+                            fill="tozeroy",
+                            fillcolor="rgba(0,229,160,0.08)" if equity[-1] >= 100 else "rgba(255,77,106,0.08)",
+                        ))
+                        eq_fig.update_layout(
+                            title=f"{bt_ticker} Estimator Backtest — Equity Curve",
+                            yaxis_title="Equity ($100 start)",
+                            height=300,
+                            margin=dict(l=40, r=20, t=40, b=30),
+                            template="plotly_dark",
+                            paper_bgcolor="#0a0b14",
+                            plot_bgcolor="#0a0b14",
+                        )
+                        st.plotly_chart(eq_fig, use_container_width=True)
+
+                        # Trades table
+                        bt_display = bt_results[[
+                            "entry_date", "exit_date", "direction", "verdict", "confidence",
+                            "best_setup", "vol_bias", "vol_trend", "fib_bias", "score",
+                            "entry", "stop", "target1", "exit", "exit_reason", "pnl_pct",
+                        ]].copy()
+                        bt_display.columns = [
+                            "Entry Date", "Exit Date", "Dir", "Verdict", "Conf",
+                            "Best", "Vol Bias", "Vol Trend", "Fib", "Score",
+                            "Entry $", "Stop $", "Target $", "Exit $", "Reason", "P&L %",
+                        ]
+                        st.dataframe(bt_display, use_container_width=True,
+                                     height=min(40 * len(bt_display) + 38, 500))
+
+                        # CSV download
+                        bt_csv = bt_display.to_csv(index=False)
+                        st.download_button(
+                            "📥 Download Backtest CSV", bt_csv,
+                            file_name=f"estimator_backtest_{bt_ticker}_{date.today()}.csv",
+                            mime="text/csv", use_container_width=True,
+                        )
+            except Exception as exc:
+                st.error(f"Backtest error: {exc}")
+
+# # ── Scan for bullish stocks (COMMENTED OUT) ──────────────────────────
+# if scan_btn:
+#   with tab_scanner:
+#     ... (Technical Scanner commented out)
+
+# ── Date Lookup handler ──────────────────────────────
+if dl_run:
+  with tab_backtest:
+    if missing_creds:
+        st.error("Enter API credentials in the sidebar first.")
+    elif not dl_ticker:
+        st.warning("Enter a ticker to look up.")
+    else:
+        with st.spinner(f"Looking up {dl_ticker} on {dl_date}..."):
+            try:
+                # Fetch enough data before the lookup date for indicators
+                lookup_start = dl_date - timedelta(days=400)
+                if data_source == "Alpaca":
+                    dl_daily = get_daily_bars_alpaca(dl_ticker, str(lookup_start), str(dl_date), api_key, api_secret)
+                else:
+                    dl_daily = get_daily_bars(dl_ticker, str(lookup_start), str(dl_date), api_key)
+
+                if dl_daily is None or dl_daily.empty or len(dl_daily) < 60:
+                    st.warning(f"Not enough data for {dl_ticker} up to {dl_date} ({len(dl_daily) if dl_daily is not None else 0} bars).")
+                else:
+                    # Find the bar at or just before the requested date
+                    dl_date_str = str(dl_date)
+                    valid_dates = [d for d in dl_daily.index if str(d)[:10] <= dl_date_str]
+                    if not valid_dates:
+                        st.warning(f"No trading data found on or before {dl_date} for {dl_ticker}.")
+                    else:
+                        target_idx = len([d for d in dl_daily.index if d <= valid_dates[-1]]) - 1
+                        actual_date = str(dl_daily.index[target_idx])[:10]
+                        sig = _estimator_signal_at(dl_daily, target_idx, use_fib=use_fib, fib_tol=fib_tol, ticker=dl_ticker)
+
+                        if sig is None:
+                            st.info(f"No signal generated for {dl_ticker} on {actual_date} (neutral or insufficient data).")
+                        else:
+                            st.markdown(f"### 📅 {dl_ticker} — Signal on {actual_date}")
+                            grade_info = _get_entry_grade(sig["score"], sig["confidence"])
+                            dl_row = {
+                                "Date": actual_date,
+                                "Ticker": dl_ticker,
+                                "Grade": grade_info["entry_grade"],
+                                "Entry Signal": grade_info["entry_label"],
+                                "Exp WR%": f"{grade_info['expected_wr']:.0f}%",
+                                "Exp Avg P&L": f"{grade_info['expected_avg']:+.2f}%",
+                                "Price": f"${sig['entry']:.2f}",
+                                "Verdict": sig["verdict"],
+                                "Confidence": sig["confidence"],
+                                "Direction": sig["direction"],
+                                "Score": sig["score"],
+                                "Fib Bias": sig["fib_bias"],
+                                "Vol Bias": sig["vol_bias"],
+                                "Vol Trend": sig["vol_trend"],
+                                "Best Setup": "Y" if sig["best_setup"] else "N",
+                                "Entry": f"${sig['entry']:.2f}",
+                                "Stop": f"${sig['stop']:.2f}",
+                                "Target 1": f"${sig['target1']:.2f}",
+                                "Signals": sig["signals"],
+                            }
+                            dl_df = pd.DataFrame([dl_row])
+                            st.dataframe(dl_df, use_container_width=True, hide_index=True)
+
+                            # CSV download
+                            dl_csv = dl_df.to_csv(index=False)
+                            st.download_button(
+                                "📥 Download Signal CSV", dl_csv,
+                                file_name=f"signal_{dl_ticker}_{actual_date}.csv",
+                                mime="text/csv", use_container_width=True,
+                            )
+            except Exception as exc:
+                st.error(f"Lookup error: {exc}")
+
+# ── Next Day Planning handler ────────────────────────
+if plan_run:
+  with tab_plan:
+    if missing_creds:
+        st.error("Enter API credentials in the sidebar first.")
+    else:
+        plan_tickers = [t.strip().upper() for t in plan_tickers_raw.strip().split(",") if t.strip()]
+        if not plan_tickers:
+            st.warning("Enter at least one ticker.")
+        else:
+            st.markdown("### 🗓️ Tomorrow's Intraday Plan")
+            plan_progress = st.progress(0)
+            plan_status = st.empty()
+            plan_rows = []
+
+            for i, ticker in enumerate(plan_tickers):
+                plan_status.text(f"Analyzing {ticker}... ({i+1}/{len(plan_tickers)})")
+                plan_progress.progress((i + 1) / len(plan_tickers))
+                try:
+                    p_end = plan_date
+                    p_start = p_end - timedelta(days=400)
+                    if data_source == "Alpaca":
+                        p_daily = get_daily_bars_alpaca(ticker, str(p_start), str(p_end), api_key, api_secret)
+                    else:
+                        p_daily = get_daily_bars(ticker, str(p_start), str(p_end), api_key)
+
+                    if p_daily is None or p_daily.empty or len(p_daily) < 60:
+                        continue
+
+                    # ── Intraday signal — simpler than swing signal ───────────────
+                    # For options planning we just need: direction, entry, ATR levels.
+                    # We do NOT apply swing-trade filters (vol conflict, LOW conf, etc.)
+                    # because intraday options don't hold overnight and every stock with
+                    # a daily candle is tradeable regardless of signal strength.
+                    daily_close = float(p_daily["close"].iloc[-1])
+                    daily_open  = float(p_daily["open"].iloc[-1])
+                    atr_14 = float((p_daily["high"] - p_daily["low"]).rolling(14).mean().iloc[-1])
+
+                    if daily_close > daily_open:
+                        direction = "LONG"
+                    elif daily_close < daily_open:
+                        direction = "SHORT"
+                    else:
+                        # True doji — use 5-day trend as tiebreaker
+                        prev5 = p_daily["close"].iloc[-6:-1]
+                        direction = "LONG" if daily_close >= float(prev5.iloc[0]) else "SHORT"
+
+                    # Build a lightweight signal dict matching _estimator_signal_at output
+                    recent_low  = float(p_daily["low"].iloc[-10:].min())
+                    recent_high = float(p_daily["high"].iloc[-10:].max())
+                    entry = round(daily_close, 2)
+
+                    if direction == "LONG":
+                        stop_px = round(recent_low  - atr_14 * 0.3, 2)
+                    else:
+                        stop_px = round(recent_high + atr_14 * 0.3, 2)
+
+                    # Use the full scoring engine for informational score/verdict only
+                    # (doesn't gate the entry — all stocks get a plan row)
+                    sig_full = _estimator_signal_at(p_daily, len(p_daily) - 1,
+                                                    use_fib=use_fib, fib_tol=fib_tol, ticker="")
+                    if sig_full is not None:
+                        verdict    = sig_full["verdict"]
+                        confidence = sig_full["confidence"]
+                        score      = sig_full["score"]
+                        fib_bias   = sig_full["fib_bias"]
+                        vol_bias   = sig_full["vol_bias"]
+                        vol_trend  = sig_full["vol_trend"]
+                        signals    = sig_full["signals"]
+                        best_setup = sig_full["best_setup"]
+                    else:
+                        # Filtered by swing rules — show raw candle info
+                        verdict    = "LEAN BULLISH" if direction == "LONG" else "LEAN BEARISH"
+                        confidence = "LOW"
+                        score      = 2 if direction == "LONG" else -2
+                        fib_bias   = "N/A"
+                        vol_bias   = "N/A"
+                        vol_trend  = "N/A"
+                        signals    = "Day:BULL" if direction == "LONG" else "Day:BEAR"
+                        best_setup = False
+                    atr_1d = atr_14  # single-day expected range
+                    intra_stop_dist = round(atr_1d * 0.3, 2)   # ~30% of daily range
+                    intra_t1_dist = round(atr_1d * 0.5, 2)     # ~50% of daily range (1.7:1 R:R)
+                    intra_t2_dist = round(atr_1d * 0.8, 2)     # ~80% of daily range (2.7:1 R:R)
+
+                    if direction == "LONG":
+                        intra_stop = round(entry - intra_stop_dist, 2)
+                        intra_t1 = round(entry + intra_t1_dist, 2)
+                        intra_t2 = round(entry + intra_t2_dist, 2)
+                    else:
+                        intra_stop = round(entry + intra_stop_dist, 2)
+                        intra_t1 = round(entry - intra_t1_dist, 2)
+                        intra_t2 = round(entry - intra_t2_dist, 2)
+
+                    # ── ATR-based strike selection ─────────────────────────────
+                    # Spread width = ~40% of ATR (one intraday stop-distance).
+                    # Capped at ATR so the OTM strike is always reachable on a normal day.
+                    # Snapped to standard listed increments: 0.5, 1, 2, 2.5, 5, 10.
+                    LISTED_INCS = [0.5, 1, 2, 2.5, 5, 10]
+
+                    spread_target = atr_14 * 0.40
+                    # Nearest listed inc >= target
+                    strike_inc = next((s for s in LISTED_INCS if s >= spread_target), LISTED_INCS[-1])
+                    # Floor: min sensible increment for the price level
+                    min_inc = 0.5 if entry < 20 else (1 if entry < 50 else 2.5)
+                    # Cap: don't pick a spread wider than the ATR (OTM would be unreachable)
+                    max_inc = next((s for s in LISTED_INCS if s >= atr_14), LISTED_INCS[-1])
+                    strike_inc = max(strike_inc, min_inc)
+                    strike_inc = min(strike_inc, max_inc)
+
+                    atm_strike = round(round(entry / strike_inc) * strike_inc, 2)
+                    spread_pct = round(strike_inc / entry * 100, 1)
+
+                    if direction == "LONG":
+                        itm_strike = round(atm_strike - strike_inc, 2)
+                        otm_strike = round(atm_strike + strike_inc, 2)
+                        opt_type = "CALL"
+                        aggressive   = f"${otm_strike} Call (OTM +{spread_pct}% — needs ${strike_inc:.2f} move)"
+                        moderate     = f"${atm_strike} Call (ATM — balanced, spread ${strike_inc:.2f})"
+                        conservative = f"${itm_strike} Call (ITM -{spread_pct}% — higher delta)"
+                    else:
+                        itm_strike = round(atm_strike + strike_inc, 2)
+                        otm_strike = round(atm_strike - strike_inc, 2)
+                        opt_type = "PUT"
+                        aggressive   = f"${otm_strike} Put (OTM -{spread_pct}% — needs ${strike_inc:.2f} move)"
+                        moderate     = f"${atm_strike} Put (ATM — balanced, spread ${strike_inc:.2f})"
+                        conservative = f"${itm_strike} Put (ITM +{spread_pct}% — higher delta)"
+
+                    # Expiry suggestion — skip weekends properly
+                    def _next_trading_day(d, skip=1):
+                        """Return the Nth next trading day from d, skipping weekends."""
+                        result = d
+                        added = 0
+                        while added < skip:
+                            result += timedelta(days=1)
+                            if result.weekday() < 5:  # Mon–Fri
+                                added += 1
+                        return result
+
+                    next_trade   = _next_trading_day(p_end, 1)   # next trading day (0DTE)
+                    trade_plus2  = _next_trading_day(p_end, 3)   # 3 trading days out (2-3DTE)
+                    expiry_0dte  = next_trade.strftime("%m/%d")
+                    expiry_2dte  = trade_plus2.strftime("%m/%d")
+
+                    gap_threshold = round(entry * 0.005, 2)
+
+                    if direction == "LONG":
+                        open_above = f"Enter CALL at ~${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_between = f"Better entry between ${intra_stop:.2f}-${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_below_stop = f"Opens below ${intra_stop:.2f} — SKIP CALL, consider PUT"
+                        big_gap = f"Gap up >${gap_threshold:.2f} above ${entry:.2f} — wait for pullback near ${entry:.2f}"
+                    else:
+                        open_above = f"Opens above ${intra_stop:.2f} — SKIP PUT, consider CALL"
+                        open_between = f"Enter PUT at ~${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_below_stop = f"Better entry between ${entry:.2f}-${intra_stop:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        big_gap = f"Gap down >${gap_threshold:.2f} below ${entry:.2f} — wait for bounce near ${entry:.2f}"
+
+                    grade_info = _get_entry_grade(score, confidence)
+                    # Classify instrument for note label only
+                    profile     = _classify_instrument(ticker, p_daily)
+                    is_mean_rev = profile["is_mean_rev"]
+                    intraday_note = "⚠️ ETF/mean-rev — intraday only, no swing" if is_mean_rev else ""
+                    plan_rows.append({
+                        "Ticker": ticker,
+                        "Grade": grade_info["entry_grade"],
+                        "Entry Signal": grade_info["entry_label"],
+                        "Exp WR%": f"{grade_info['expected_wr']:.0f}%",
+                        "Direction": direction,
+                        "Option": opt_type,
+                        "Verdict": verdict,
+                        "Confidence": confidence,
+                        "Note": intraday_note,
+                        "Best Setup": "Y" if best_setup else "N",
+                        "Close": round(entry, 2),
+                        "ATR": round(atr_1d, 2),
+                        "Intra Stop": intra_stop,
+                        "Intra T1": intra_t1,
+                        "Intra T2": intra_t2,
+                        "Risk $": intra_stop_dist,
+                        "T1 Reward $": intra_t1_dist,
+                        "T2 Reward $": intra_t2_dist,
+                        "ATM Strike": atm_strike,
+                        "Aggressive": aggressive,
+                        "Moderate": moderate,
+                        "Conservative": conservative,
+                        "0DTE Exp": expiry_0dte,
+                        "2-3DTE Exp": expiry_2dte,
+                        "Fib": fib_bias,
+                        "Vol Bias": vol_bias,
+                        "Vol Trend": vol_trend,
+                        "Signals": signals,
+                        "If opens near entry": open_above if direction == "LONG" else open_between,
+                        "If opens between entry & stop": open_between if direction == "LONG" else open_above,
+                        "If opens past stop": open_below_stop,
+                        "If big gap": big_gap,
+                    })
+                    # Add multi-timeframe bias to the last appended row
+                    bias_info = get_multiframe_bias_eval(ticker, entry, direction)
+                    if bias_info:
+                        plan_rows[-1]["Short TF"] = bias_info.get("tf_short", "")
+                        plan_rows[-1]["Short Bias"] = bias_info.get("bias_10min", "N/A")
+                        plan_rows[-1]["Long TF"] = bias_info.get("tf_long", "")
+                        plan_rows[-1]["Long Bias"] = bias_info.get("bias_30min", "N/A")
+                        plan_rows[-1]["Bias Align"] = ("✅" if bias_info.get("alignment") == "CONFIRMED" else "⚠️") + " " + bias_info.get("alignment", "")
+                    else:
+                        plan_rows[-1]["Short TF"] = ""
+                        plan_rows[-1]["Short Bias"] = "N/A"
+                        plan_rows[-1]["Long TF"] = ""
+                        plan_rows[-1]["Long Bias"] = "N/A"
+                        plan_rows[-1]["Bias Align"] = "—"
+                except:
+                    continue
+
+            plan_progress.empty()
+            plan_status.empty()
+
+            if not plan_rows:
+                st.info("No actionable signals generated for the given tickers.")
+            else:
+                plan_df = pd.DataFrame(plan_rows)
+
+                # ── Compact symbol summary table ───────────────────────────
+                summary_cols = ["Ticker", "Direction", "Option", "Grade",
+                                "Verdict", "Confidence", "Close", "ATR",
+                                "Intra Stop", "Intra T1", "Intra T2",
+                                "ATM Strike", "0DTE Exp", "2-3DTE Exp",
+                                "Short Bias", "Long Bias", "Bias Align"]
+                summary_cols = [c for c in summary_cols if c in plan_df.columns]
+                summary_df = plan_df[summary_cols].copy()
+                summary_df.rename(columns={
+                    "Intra Stop": "Stop", "Intra T1": "T1",
+                    "Intra T2": "T2", "ATM Strike": "ATM",
+                    "0DTE Exp": "0DTE", "2-3DTE Exp": "2-3DTE",
+                }, inplace=True)
+                st.markdown("#### 📋 All Symbols")
+                st.dataframe(summary_df, use_container_width=True,
+                             hide_index=True, height=min(38*len(summary_df)+38, 320))
+                longs = [r for r in plan_rows if r["Direction"] == "LONG"]
+                shorts = [r for r in plan_rows if r["Direction"] == "SHORT"]
+                best = [r for r in plan_rows if r["Best Setup"] == "Y"]
+
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                sc1.metric("Total Signals", len(plan_rows))
+                sc2.metric("LONG (Calls)", len(longs))
+                sc3.metric("SHORT (Puts)", len(shorts))
+                sc4.metric("Best Setups", len(best))
+
+                # Highlight best setups
+                if best:
+                    st.markdown(
+                        '<div style="background:#00e5a010;border:1px solid #00e5a030;padding:12px;'
+                        'border-radius:6px;margin:12px 0">'
+                        '<div style="font-size:11px;font-weight:700;color:#00e5a0;margin-bottom:6px">⭐ BEST SETUPS (all signals aligned)</div>'
+                        + "".join(
+                            f'<div style="font-size:12px;color:#e8ecff;margin-bottom:2px">'
+                            f'<b>{r["Ticker"]}</b> — {r["Option"]} · ATM ${r["ATM Strike"]:.0f} · '
+                            f'Stop ${r["Intra Stop"]:.2f} · T1 ${r["Intra T1"]:.2f} · T2 ${r["Intra T2"]:.2f}</div>'
+                            for r in best
+                        )
+                        + '</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Action plan per ticker
+                for r in plan_rows:
+                    dir_color = "#00e5a0" if r["Direction"] == "LONG" else "#ff4d6a"
+                    opt_icon = "📞" if r["Option"] == "CALL" else "📉"
+                    best_badge = ' <span style="background:#00e5a020;color:#00e5a0;font-size:8px;padding:1px 5px;border-radius:2px;font-weight:700">⭐ BEST</span>' if r["Best Setup"] == "Y" else ""
+                    st.markdown(
+                        f'<div style="background:#0d0f17;border:1px solid #1a1d2e;border-left:3px solid {dir_color};'
+                        f'padding:14px 18px;border-radius:4px;margin-bottom:8px">'
+                        # Header
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+                        f'<span style="font-size:15px;font-weight:900;color:#e8ecff">{opt_icon} {r["Ticker"]} — {r["Option"]}{best_badge}</span>'
+                        f'<span style="color:{dir_color};font-weight:700;font-size:12px">{r["Direction"]} · {r["Verdict"]} · {r["Confidence"]}</span>'
+                        f'</div>'
+                        # Price levels
+                        f'<div style="display:flex;gap:16px;font-size:11px;margin-bottom:8px;flex-wrap:wrap">'
+                        f'<span style="color:#6b7099">Close: <b style="color:#e8ecff">${r["Close"]:.2f}</b></span>'
+                        f'<span style="color:#6b7099">ATR: <b style="color:#a78bfa">${r["ATR"]:.2f}</b></span>'
+                        f'<span style="color:#6b7099">Stop: <b style="color:#ff4d6a">${r["Intra Stop"]:.2f}</b> (-${r["Risk $"]:.2f})</span>'
+                        f'<span style="color:#6b7099">T1: <b style="color:#00e5a0">${r["Intra T1"]:.2f}</b> (+${r["T1 Reward $"]:.2f})</span>'
+                        f'<span style="color:#6b7099">T2: <b style="color:#22d3ee">${r["Intra T2"]:.2f}</b> (+${r["T2 Reward $"]:.2f})</span>'
+                        f'</div>'
+                        # Option strikes
+                        f'<div style="background:#090b13;border:1px solid #1a1d2e;border-radius:4px;padding:10px;margin-bottom:8px">'
+                        f'<div style="font-size:8px;color:#3a3d5c;letter-spacing:1.5px;margin-bottom:6px">OPTION STRIKES · Exp: {r["0DTE Exp"]} (0DTE) or {r["2-3DTE Exp"]} (2-3 DTE)</div>'
+                        f'<div style="font-size:10px;line-height:2;color:#c8cce8">'
+                        f'<div>🎯 Aggressive: <b style="color:#f5c842">{r["Aggressive"]}</b></div>'
+                        f'<div>⚖️ Moderate: <b style="color:#4d9fff">{r["Moderate"]}</b></div>'
+                        f'<div>🛡️ Conservative: <b style="color:#00e5a0">{r["Conservative"]}</b></div>'
+                        f'</div></div>'
+                        # Scenarios
+                        f'<div style="font-size:10px;line-height:2.2;color:#c8cce8">'
+                        f'<div>✅ Opens near entry → <b>{r["If opens near entry"]}</b></div>'
+                        f'<div>⚡ Opens between entry & stop → <b>{r["If opens between entry & stop"]}</b></div>'
+                        f'<div>❌ Opens past stop → <b>{r["If opens past stop"]}</b></div>'
+                        f'<div>⚠️ Big gap → <b>{r["If big gap"]}</b></div>'
+                        f'</div>'
+                        f'<div style="font-size:9px;color:#3a3d5c;margin-top:6px">{r["Signals"]} · Fib:{r["Fib"]} · Vol:{r["Vol Bias"]} · Trend:{r["Vol Trend"]}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # CSV download
+                # Store plan in session for morning check
+                st.session_state["plan_data"] = plan_rows
+
+                plan_csv = plan_df.to_csv(index=False)
+                st.download_button(
+                    "📥 Download Tomorrow's Plan CSV", plan_csv,
+                    file_name=f"intraday_plan_{date.today()}.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+
+# ── Check Open Prices ──────────────────────────────────────
+if check_open_run:
+  with tab_plan:
+    saved_plan = st.session_state.get("plan_data", [])
+    if not saved_plan:
+        st.warning("Generate a plan first, then check open prices.")
+    elif not YFINANCE_AVAILABLE:
+        st.error("yfinance is required for live price checks.")
+    else:
+        check_date = plan_date
+        is_live    = (check_date == date.today())
+        date_header = st.empty()
+        actual_trade_date = None
+        open_status = st.empty()
+        fetch_errors = []
+        shown = 0
+        table_rows = []  # Collect all scenario results for table
+
+        for i, r in enumerate(saved_plan):
+            if not isinstance(r, dict):
+                continue
+            ticker = r.get("Ticker") or r.get("ticker", "UNKNOWN")
+            open_status.text(f"Fetching {ticker}... ({i+1}/{len(saved_plan)})")
+            try:
+                # Pull every field defensively — handles stale plan rows
+                entry      = r.get("Close") or r.get("entry")
+                intra_stop = r.get("Intra Stop")
+                intra_t1   = r.get("Intra T1")
+                intra_t2   = r.get("Intra T2")
+                atm_strike = r.get("ATM Strike")
+                atr_val    = r.get("ATR")
+                direction  = r.get("Direction")
+                opt_type   = r.get("Option")
+                confidence = r.get("Confidence", "N/A")
+                exp_0dte   = r.get("0DTE Exp", "")
+                exp_2dte   = r.get("2-3DTE Exp", "")
+                txt_gap    = r.get("If big gap", "N/A")
+                txt_near   = r.get("If opens near entry", "N/A")
+                txt_btwn   = r.get("If opens between entry & stop", "N/A")
+                txt_past   = r.get("If opens past stop", "N/A")
+
+                missing = [k for k, v in {
+                    "Close": entry, "Intra Stop": intra_stop, "Intra T1": intra_t1,
+                    "ATM Strike": atm_strike, "ATR": atr_val, "Direction": direction,
+                }.items() if v is None]
+                if missing:
+                    fetch_errors.append(f"{ticker}: missing {missing} — regenerate plan")
+                    continue
+
+                entry=float(entry); intra_stop=float(intra_stop); intra_t1=float(intra_t1)
+                intra_t2=float(intra_t2) if intra_t2 is not None else intra_t1
+                atm_strike=float(atm_strike); atr_val=float(atr_val)
+
+                # Fetch live price via yfinance
+                tk = yf.Ticker(ticker)
+                today_hist = (tk.history(period="1d") if is_live else
+                              tk.history(start=str(check_date + timedelta(days=1)),
+                                         end=str(check_date + timedelta(days=7))))
+
+                if today_hist is None or (hasattr(today_hist, "empty") and today_hist.empty):
+                    fetch_errors.append(f"{ticker}: no data — market may not be open yet")
+                    continue
+
+                # ── Robust price extraction — handles all yfinance column formats ──
+                # yfinance can return: plain columns, MultiIndex (field, ticker),
+                # or MultiIndex (ticker, field) depending on version and ticker alias.
+                def _extract_price(df, field, row_idx):
+                    """Extract a single price value from a yfinance DataFrame robustly."""
+                    cols = df.columns
+                    # 1. Plain columns: ["Open", "High", ...]
+                    if field in cols:
+                        val = df[field].iloc[row_idx]
+                        if val is not None and str(val) != "nan":
+                            return float(val)
+                    # 2. MultiIndex — try (field, *) pattern
+                    if hasattr(cols, "levels"):
+                        for col in cols:
+                            if isinstance(col, tuple) and col[0] == field:
+                                val = df[col].iloc[row_idx]
+                                if val is not None and str(val) != "nan":
+                                    return float(val)
+                        # 3. MultiIndex — try (*, field) pattern
+                        for col in cols:
+                            if isinstance(col, tuple) and col[-1] == field:
+                                val = df[col].iloc[row_idx]
+                                if val is not None and str(val) != "nan":
+                                    return float(val)
+                    # 4. Last resort — positional (Open=col0, Close=col3)
+                    pos = {"Open": 0, "Close": 3}
+                    if field in pos and len(df.columns) > pos[field]:
+                        val = df.iloc[row_idx, pos[field]]
+                        if val is not None:
+                            return float(val)
+                    raise ValueError(f"Cannot extract {field} from DataFrame columns: {list(cols)[:6]}")
+
+                open_price    = _extract_price(today_hist, "Open",  0)
+                current_price = _extract_price(today_hist, "Close", -1)
+
+                # Fetch option data for the strike
+                opt_prev_open = opt_prev_high = opt_prev_low = opt_prev_close = opt_curr_open = None
+                try:
+                    # Try yfinance first
+                    stock = yf.Ticker(ticker)
+                    expirations = stock.options
+                    if expirations:
+                        exp_date = expirations[0]
+                        opt_chain = stock.option_chain(exp_date)
+                        calls = opt_chain.calls if dopt == "CALL" else opt_chain.puts
+                        calls = calls.sort_values(by='strike')
+                        closest_strike = calls.iloc[(calls['strike'] - atm_strike).abs().argsort()[0]]
+                        if not closest_strike.empty:
+                            opt_curr_open = closest_strike.get('lastPrice', None)
+                            opt_prev_open = opt_curr_open
+                            opt_prev_close = opt_curr_open
+                except:
+                    # Fallback to Alpaca
+                    try:
+                        if api_key and api_secret:
+                            headers = {
+                                'APCA-API-KEY-ID': api_key,
+                                'APCA-API-SECRET-KEY': api_secret,
+                            }
+                            base_url = "https://api.alpaca.markets"
+                            resp = requests.get(
+                                f"{base_url}/v1beta1/options/snapshots/{ticker}",
+                                headers=headers,
+                                timeout=10
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                snapshots = data.get('snapshots', [])
+                                for snap in snapshots:
+                                    contract = snap.get('option_details', {})
+                                    strike = contract.get('strike_price')
+                                    if strike and abs(strike - atm_strike) < 0.5:
+                                        opt_curr_open = snap.get('latest_quote', {}).get('last_quote', {}).get('ask')
+                                        if opt_curr_open:
+                                            opt_prev_open = opt_curr_open
+                                            opt_prev_close = opt_curr_open
+                                        break
+                    except:
+                        pass
+
+                if actual_trade_date is None:
+                    actual_trade_date = str(today_hist.index[0])[:10]
+                    date_label = "Live" if is_live else actual_trade_date
+                    date_header.markdown(f"### ☀️ Morning Open — Which Scenario? ({date_label})")
+
+                gap_thr  = round(entry * 0.005, 2)
+                move_raw = open_price - entry
+                move_pct = move_raw / entry * 100
+
+                if direction == "LONG":
+                    if open_price - entry > gap_thr:
+                        sc,lb,col,txt = "big_gap",   "⚠️ BIG GAP UP",               "#f5c842", txt_gap
+                    elif open_price >= entry:
+                        sc,lb,col,txt = "near_entry","✅ OPENS NEAR ENTRY",               "#00e5a0", txt_near
+                    elif open_price > intra_stop:
+                        sc,lb,col,txt = "between",   "⚡ OPENS BETWEEN ENTRY & STOP",     "#4d9fff", txt_btwn
+                    else:
+                        sc,lb,col,txt = "past_stop", "❌ OPENS PAST STOP",                "#ff4d6a", txt_past
+                else:
+                    if entry - open_price > gap_thr:
+                        sc,lb,col,txt = "big_gap",   "⚠️ BIG GAP DOWN",             "#f5c842", txt_gap
+                    elif open_price <= entry:
+                        sc,lb,col,txt = "near_entry","✅ OPENS NEAR ENTRY",               "#00e5a0", txt_near
+                    elif open_price < intra_stop:
+                        sc,lb,col,txt = "between",   "⚡ OPENS BETWEEN ENTRY & STOP",     "#4d9fff", txt_btwn
+                    else:
+                        sc,lb,col,txt = "past_stop", "❌ OPENS PAST STOP",                "#ff4d6a", txt_past
+
+                dd=direction; dopt=opt_type or "CALL"
+                ds=intra_stop; dt1=intra_t1; dt2=intra_t2; da=atm_strike
+
+                if sc == "past_stop":
+                    fd=round(atr_val*0.3,2); f1=round(atr_val*0.5,2); f2=round(atr_val*0.8,2)
+                    if direction == "LONG":
+                        dd="SHORT"; dopt="PUT"
+                        ds=round(open_price+fd,2); dt1=round(open_price-f1,2); dt2=round(open_price-f2,2)
+                    else:
+                        dd="LONG";  dopt="CALL"
+                        ds=round(open_price-fd,2); dt1=round(open_price+f1,2); dt2=round(open_price+f2,2)
+                    si = 5 if open_price>=200 else (2.5 if open_price>=50 else (1 if open_price>=20 else 0.5))
+                    da  = round(round(open_price/si)*si, 2)
+                    txt = f"Flipped to {dopt} at ~${open_price:.2f} — stop ${ds:.2f}, T1 ${dt1:.2f}, T2 ${dt2:.2f}"
+
+                dc  = "#00e5a0" if dd == "LONG" else "#ff4d6a"
+                ico = "📞" if dopt == "CALL" else "📉"
+                shown += 1
+
+                st.markdown(
+                    f'<div style="background:#0d0f17;border:1px solid #1a1d2e;border-left:4px solid {col};'
+                    f'padding:14px 18px;border-radius:4px;margin-bottom:8px">'
+                    f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+                    f'<span style="font-size:15px;font-weight:900;color:#e8ecff">{ico} {ticker} — {dopt}'
+                    f'{"  🔄 FLIPPED" if sc=="past_stop" else ""}</span>'
+                    f'<span style="color:{dc};font-weight:700;font-size:12px">{dd} · {confidence}</span>'
+                    f'</div>'
+                    f'<div style="display:flex;gap:16px;font-size:12px;margin-bottom:8px;flex-wrap:wrap">'
+                    f'<span style="color:#6b7099">Prev Close: <b style="color:#e8ecff">${entry:.2f}</b></span>'
+                    f'<span style="color:#6b7099">Open: <b style="color:#f5c842">${open_price:.2f}</b></span>'
+                    f'<span style="color:#6b7099">Current: <b style="color:#a78bfa">${current_price:.2f}</b></span>'
+                    f'<span style="color:#6b7099">Move: <b style="color:{"#00e5a0" if move_raw>=0 else "#ff4d6a"}>'
+                    f'{"+" if move_raw>=0 else ""}${move_raw:.2f} ({move_pct:+.2f}%)</b></span>'
+                    f'</div>'
+                    f'<div style="background:{col}15;border:1px solid {col}40;'
+                    f'border-radius:6px;padding:10px 14px;margin-bottom:6px">'
+                    f'<div style="font-size:13px;font-weight:700;color:{col};margin-bottom:4px">{lb}</div>'
+                    f'<div style="font-size:11px;color:#e8ecff">{txt}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # ── Spread suggestion ─────────────────────────────────────
+                _sinc   = 5 if da >= 200 else (2.5 if da >= 50 else (1 if da >= 20 else 0.5))
+                _raw    = (da - atr_val * 2) if dopt == "PUT" else (da + atr_val * 2)
+                _leg2   = round(round(_raw / _sinc) * _sinc, 2)
+                _spread = f"{da:.0f}–{_leg2:.0f}"
+
+                st.markdown(
+                    f'<div style="font-size:10px;color:#6b7099;padding:4px 18px 0">'
+                    f'ATR: <b style="color:#a78bfa">${atr_val:.2f}</b> &nbsp;·&nbsp; '
+                    f'Stop: ${ds:.2f} &nbsp;·&nbsp; T1: ${dt1:.2f} &nbsp;·&nbsp; T2: ${dt2:.2f} &nbsp;·&nbsp; '
+                    f'ATM: <b style="color:{dc}">${da:.0f} {dopt}</b> &nbsp;·&nbsp; Exp: {exp_0dte} / {exp_2dte}</div>'
+                    f'<div style="font-size:11px;font-weight:600;color:#4d9fff;padding:3px 18px 12px">'
+                    f'{ticker} &nbsp; {dopt} SPREAD &nbsp; {_spread} &nbsp; Exp: {exp_0dte} / {exp_2dte}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Append row to table
+                table_rows.append({
+                    "Ticker": ticker,
+                    "Direction": dd,
+                    "Option": dopt,
+                    "Stop": f"${ds:.2f}",
+                    "ATM": f"${da:.0f}",
+                    "Spread": _spread,
+                    "Exp 0DTE": exp_0dte,
+                    "Exp 2-3DTE": exp_2dte,
+                    "Confidence": confidence,
+                    "ATR": f"${atr_val:.2f}",
+                    "Prev Close": f"${entry:.2f}",
+                    "Prev Opt O": f"${opt_prev_open:.2f}" if opt_prev_open else "N/A",
+                    "Prev Opt H": f"${opt_prev_high:.2f}" if opt_prev_high else "N/A",
+                    "Prev Opt L": f"${opt_prev_low:.2f}" if opt_prev_low else "N/A",
+                    "Prev Opt C": f"${opt_prev_close:.2f}" if opt_prev_close else "N/A",
+                    "Open": f"${open_price:.2f}",
+                    "Opt Open": f"${opt_curr_open:.2f}" if opt_curr_open else "N/A",
+                    "T1": f"${dt1:.2f}",
+                    "T2": f"${dt2:.2f}",
+                    "Current": f"${current_price:.2f}",
+                    "Move": f"${move_raw:.2f} ({move_pct:+.2f}%)",
+                    "Scenario": lb,
+                    "Notes": txt[:50] + "..." if len(txt) > 50 else txt,
+                    "_scenario_id": sc,
+                })
+            except Exception as exc:
+                fetch_errors.append(f"{ticker}: {type(exc).__name__}: {exc}")
+
+        open_status.empty()
+        if shown == 0 and not fetch_errors:
+            st.info("No data returned — market may not be open yet, or regenerate plan.")
+        if fetch_errors:
+            with st.expander(f"⚠️ {len(fetch_errors)} issue(s)", expanded=True):
+                for e in fetch_errors:
+                    st.caption(e)
+
+        # Persist table_rows so they survive st.rerun() after track-button clicks
+        if table_rows:
+            st.session_state["open_check_table_rows"] = table_rows
+
+# ── Display persisted scenario tables & tracker (survives rerun) ──
+if st.session_state.get("open_check_table_rows"):
+  with tab_plan:
+    table_rows = st.session_state["open_check_table_rows"]
     st.markdown("---")
-    col_bull, col_bear = st.columns(2)
-    with col_bull:
-        if top_bullish:
-            st.markdown(
-                '<div style="background:#00e5a015;border:1px solid #00e5a040;padding:12px;border-radius:8px;margin-bottom:12px">'
-                '<div style="font-size:14px;font-weight:bold;color:#00e5a0;margin-bottom:4px">🚀 TOP BULLISH</div>'
-                '<div style="font-size:10px;color:#6b7099">High confidence longs</div>'
-                '</div>',
-                unsafe_allow_html=True
-            )
-            for rank, r in enumerate(top_bullish, 1):
-                stop_html = f'<span style="color:#ff4d6a">${r["stop_loss"]}</span>' if r.get("stop_loss") else "N/A"
-                t1_html = f'<span style="color:#00e5a0">${r["target1"]}</span>' if r.get("target1") else "N/A"
-                t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}d</span>' if r.get("t1_days") else ""
-                val_color = r.get("valuation_color", "#6b7099")
-                if r.get("target_1y") and r.get("target_upside") is not None:
-                    upside = r["target_upside"]
-                    upside_color = "#00e5a0" if upside > 0 else "#ff4d6a"
-                    target_1y_html = f'<span style="color:#4d9fff">${r["target_1y"]}</span> <span style="color:{upside_color}">({upside:+.1f}%)</span>'
+    conf_priority = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    near_entry_rows = [r for r in table_rows if r.get("Scenario", "").strip().startswith("✅ OPENS NEAR ENTRY")]
+
+    # Check if we should enable auto-tracking (8:30 AM CST or later)
+    auto_track_enabled = is_after_market_time(8, 30)  # 8:30 AM CST
+    entry_confirmation_enabled = is_after_market_time(9, 0)  # 9:00 AM CST
+
+    # Ensure tracking list exists
+    if "tracking_trades" not in st.session_state:
+        st.session_state["tracking_trades"] = []
+
+    def _make_track_entry(trade):
+        """Build a tracking dict from a table row."""
+        return {
+            "ticker": trade.get("Ticker"),
+            "entry": float(trade.get("Open", "$0").replace("$", "")),
+            "stop": float(trade.get("Stop", "$0").replace("$", "")),
+            "t1": float(trade.get("T1", "$0").replace("$", "")),
+            "t2": float(trade.get("T2", "$0").replace("$", "")),
+            "direction": trade.get("Direction"),
+            "confidence": trade.get("Confidence", "N/A"),
+            "atr": trade.get("ATR", "$0").replace("$", ""),
+            "scenario": trade.get("Scenario", ""),
+            "tracking_start_time": get_cst_now().isoformat(),
+        }
+
+    def _is_already_tracked(ticker):
+        return any(t["ticker"] == ticker for t in st.session_state["tracking_trades"])
+
+    # ── AUTO-START: auto-track ALL OPENS NEAR ENTRY at 8:30 AM CST+ ──
+    if auto_track_enabled and near_entry_rows and not st.session_state["tracking_trades"]:
+        for trade in near_entry_rows:
+            if not _is_already_tracked(trade.get("Ticker")):
+                st.session_state["tracking_trades"].append(_make_track_entry(trade))
+
+    # ── Helper: render a scenario table with Track buttons on each row ──
+    def _render_trackable_table(rows, title, table_key, display_cols):
+        """Display a scenario table with a Track button per row."""
+        st.markdown(f"### {title}")
+        if not rows:
+            st.dataframe(pd.DataFrame(columns=display_cols), use_container_width=True, height=78)
+            return
+        df = pd.DataFrame(rows)[display_cols]
+        st.dataframe(df, use_container_width=True, height=min(40 * max(len(df), 1) + 38, 400))
+        # Track buttons row underneath the table
+        btn_cols = st.columns(min(len(rows), 8))
+        for idx, trade in enumerate(rows[:8]):
+            tkr = trade.get("Ticker", "?")
+            already = _is_already_tracked(tkr)
+            label = f"🎯 {tkr}" if already else f"📌 {tkr}"
+            with btn_cols[idx % len(btn_cols)]:
+                if st.button(label, key=f"trk_{table_key}_{idx}_{tkr}", use_container_width=True, disabled=already):
+                    st.session_state["tracking_trades"].append(_make_track_entry(trade))
+                    st.rerun()
+
+    # ── SCENARIO TABLES with per-row Track buttons ──
+    between_rows = [r for r in table_rows if r.get("Scenario", "").strip().startswith("⚡ OPENS BETWEEN ENTRY & STOP")]
+    other_rows = [r for r in table_rows if not (r.get("Scenario", "").strip().startswith("✅ OPENS NEAR ENTRY") or r.get("Scenario", "").strip().startswith("⚡ OPENS BETWEEN ENTRY & STOP"))]
+    between_rows.sort(key=lambda x: conf_priority.get(x.get("Confidence", "LOW"), 999))
+    other_rows.sort(key=lambda x: conf_priority.get(x.get("Confidence", "LOW"), 999))
+    display_cols = [c for c in table_rows[0].keys() if c != "_scenario_id"]
+    # Move Scenario and Notes right after Ticker (symbol)
+    for _move in ["Notes", "Scenario"]:
+        if _move in display_cols:
+            display_cols.remove(_move)
+            idx = display_cols.index("Ticker") + 1 if "Ticker" in display_cols else 0
+            display_cols.insert(idx, _move)
+
+    _render_trackable_table(near_entry_rows, "✅ OPENS NEAR ENTRY", "near", display_cols)
+    _render_trackable_table(between_rows, "⚡ OPENS BETWEEN ENTRY & STOP", "btwn", display_cols)
+    _render_trackable_table(other_rows, "📊 All Other Scenarios", "other", display_cols)
+
+    # ── POSITION TRACKER — multi-row table with delete buttons ──────────
+    tracked = st.session_state.get("tracking_trades", [])
+    if tracked:
+        st.markdown("---")
+        st.markdown(f"### 📍 Tracking {len(tracked)} Position(s)")
+
+        # Clear All button
+        if st.button("❌ Clear All Tracking", key="clear_all_tracking"):
+            st.session_state["tracking_trades"] = []
+            st.rerun()
+
+        import yfinance as yf
+        track_rows = []
+        error_tickers = []
+        for ti, tr in enumerate(tracked):
+            try:
+                tk = yf.Ticker(tr['ticker'])
+                hist = tk.history(period="5d")
+                if hist.empty:
+                    error_tickers.append(tr['ticker'])
+                    continue
+                live_price = float(hist["Close"].iloc[-1])
+                entry = tr['entry']
+                stop = tr['stop']
+                t1 = tr['t1']
+                t2 = tr['t2']
+                direction = tr['direction']
+
+                if direction == "LONG":
+                    pnl_pct = (live_price - entry) / entry * 100
+                    passed_stop = live_price <= stop
+                    passed_t1 = live_price >= t1
+                    passed_t2 = live_price >= t2
                 else:
-                    target_1y_html = "N/A"
-                st.markdown(
-                    f'<div style="background:#0d0f17;border:1px solid #1a1d2e;padding:10px;border-radius:4px;margin-bottom:6px">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                    f'<span style="font-size:14px;font-weight:bold;color:#e8ecff">#{rank} {r["ticker"]}</span>'
-                    f'<span style="font-size:11px;color:#00e5a0">+{r["score"]}</span>'
-                    f'</div>'
-                    f'<div style="font-size:10px;color:#6b7099;margin-top:4px">'
-                    f'${r["price"]} · Stop: {stop_html} · T1: {t1_html} {t1_time}'
-                    f'</div>'
-                    f'<div style="font-size:9px;margin-top:3px">'
-                    f'<span style="color:{val_color}">{r.get("valuation", "N/A")}</span> · '
-                    f'{r.get("market_cap", "N/A")} · '
-                    f'1Y: {target_1y_html}'
-                    f'</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-        else:
-            st.info("No high-confidence bullish setups found.")
-    with col_bear:
-        if top_bearish:
-            st.markdown(
-                '<div style="background:#ff4d6a15;border:1px solid #ff4d6a40;padding:12px;border-radius:8px;margin-bottom:12px">'
-                '<div style="font-size:14px;font-weight:bold;color:#ff4d6a;margin-bottom:4px">📉 TOP BEARISH</div>'
-                '<div style="font-size:10px;color:#6b7099">High confidence shorts</div>'
-                '</div>',
-                unsafe_allow_html=True
-            )
-            for rank, r in enumerate(top_bearish, 1):
-                stop_html = f'<span style="color:#ff4d6a">${r["stop_loss"]}</span>' if r.get("stop_loss") else "N/A"
-                t1_html = f'<span style="color:#00e5a0">${r["target1"]}</span>' if r.get("target1") else "N/A"
-                t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}d</span>' if r.get("t1_days") else ""
-                val_color = r.get("valuation_color", "#6b7099")
-                if r.get("target_1y") and r.get("target_upside") is not None:
-                    upside = r["target_upside"]
-                    upside_color = "#00e5a0" if upside > 0 else "#ff4d6a"
-                    target_1y_html = f'<span style="color:#4d9fff">${r["target_1y"]}</span> <span style="color:{upside_color}">({upside:+.1f}%)</span>'
+                    pnl_pct = (entry - live_price) / entry * 100
+                    passed_stop = live_price >= stop
+                    passed_t1 = live_price <= t1
+                    passed_t2 = live_price <= t2
+
+                # Multi-timeframe bias
+                bias_eval = get_multiframe_bias_eval(tr['ticker'], entry, direction)
+                bias_short = bias_eval.get("bias_10min", "N/A") if bias_eval else "N/A"
+                bias_long = bias_eval.get("bias_30min", "N/A") if bias_eval else "N/A"
+                alignment = bias_eval.get("alignment", "N/A") if bias_eval else "N/A"
+                tf_short = bias_eval.get("tf_short", "10m") if bias_eval else "10m"
+                tf_long = bias_eval.get("tf_long", "30m") if bias_eval else "30m"
+                align_icon = "✅" if alignment == "CONFIRMED" else ("⚠️" if alignment == "DIVERGED" else "")
+
+                # Suggested action
+                if passed_stop:
+                    action = "🔴 EXIT — Stop Hit"
+                elif passed_t2:
+                    action = "🏆 FULL PROFIT — T2"
+                elif passed_t1:
+                    action = "🎉 SCALE OUT — T1"
+                elif bias_eval and alignment == "CONFIRMED":
+                    action = "✅ HOLD — Confirmed"
+                elif bias_eval and alignment == "DIVERGED":
+                    action = "⚠️ CAUTION — Diverged"
+                elif pnl_pct >= 2.0:
+                    action = "📈 TRAIL STOP"
                 else:
-                    target_1y_html = "N/A"
-                st.markdown(
-                    f'<div style="background:#0d0f17;border:1px solid #1a1d2e;padding:10px;border-radius:4px;margin-bottom:6px">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                    f'<span style="font-size:14px;font-weight:bold;color:#e8ecff">#{rank} {r["ticker"]}</span>'
-                    f'<span style="font-size:11px;color:#ff4d6a">{r["score"]}</span>'
-                    f'</div>'
-                    f'<div style="font-size:10px;color:#6b7099;margin-top:4px">'
-                    f'${r["price"]} · Stop: {stop_html} · T1: {t1_html} {t1_time}'
-                    f'</div>'
-                    f'<div style="font-size:9px;margin-top:3px">'
-                    f'<span style="color:{val_color}">{r.get("valuation", "N/A")}</span> · '
-                    f'{r.get("market_cap", "N/A")} · '
-                    f'1Y: {target_1y_html}'
-                    f'</div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
+                    action = "⏳ MONITOR"
+
+                track_rows.append({
+                    "Ticker": tr['ticker'],
+                    "Direction": direction,
+                    "Scenario": tr.get("scenario", "")[:30],
+                    "Live Price": f"${live_price:.2f}",
+                    "Entry": f"${entry:.2f}",
+                    "P&L": f"{pnl_pct:+.2f}%",
+                    "Stop": f"${stop:.2f}",
+                    "T1": f"${t1:.2f}",
+                    "T2": f"${t2:.2f}",
+                    "Confidence": tr.get('confidence', 'N/A'),
+                    f"{tf_short} Bias": bias_short,
+                    f"{tf_long} Bias": bias_long,
+                    "Alignment": f"{align_icon} {alignment}",
+                    "Action": action,
+                })
+            except Exception:
+                error_tickers.append(tr['ticker'])
+
+        if track_rows:
+            track_df = pd.DataFrame(track_rows)
+            st.dataframe(track_df, use_container_width=True,
+                         height=min(40 * max(len(track_df), 1) + 38, 400))
+
+        if error_tickers:
+            st.caption(f"⚠️ Could not fetch data for: {', '.join(error_tickers)}")
+
+        # Per-row delete buttons
+        del_cols = st.columns(min(len(tracked), 8))
+        for di, tr in enumerate(tracked[:8]):
+            with del_cols[di % len(del_cols)]:
+                if st.button(f"🗑️ {tr['ticker']}", key=f"del_trk_{di}_{tr['ticker']}", use_container_width=True):
+                    st.session_state["tracking_trades"].pop(di)
+                    st.rerun()
+
+    # ── ENTRY CONFIRMATION TABLE (after 9 AM CST) ────────────────
+    if entry_confirmation_enabled and near_entry_rows:
+        st.markdown("---")
+        st.markdown("### ✅ ENTRY CONFIRMATION TABLE (9:00 AM CST+)")
+        st.markdown("Trades that **OPENED NEAR ENTRY** with **CONFIRMED BIAS** (10m & 30m aligned)")
+
+        confirmation_rows = []
+        for trade in near_entry_rows:
+            ticker = trade.get("Ticker", "?")
+            entry_price = float(trade.get("Open", "$0").replace("$", ""))
+            direction = trade.get("Direction")
+
+            bias_data = get_multiframe_bias_eval(ticker, entry_price, direction)
+
+            if bias_data and bias_data.get("alignment") == "CONFIRMED":
+                confirmation_rows.append({
+                    "Ticker": ticker,
+                    "Entry": trade.get("Open"),
+                    "Stop": trade.get("Stop"),
+                    "T1": trade.get("T1"),
+                    "T2": trade.get("T2"),
+                    "Direction": trade.get("Direction"),
+                    "Option": trade.get("Option"),
+                    "Bias Status": f"✅ {bias_data.get('alignment')} ({bias_data.get('bias_10min')})",
+                    f"{bias_data.get('tf_short', '10m')} Bias": bias_data.get("bias_10min"),
+                    f"{bias_data.get('tf_long', '30m')} Bias": bias_data.get("bias_30min"),
+                    "Current Price": f"${bias_data.get('current_price')}",
+                    "Confidence": trade.get("Confidence"),
+                    "ATR": trade.get("ATR"),
+                })
+
+        if confirmation_rows:
+            confirm_df = pd.DataFrame(confirmation_rows)
+            st.dataframe(confirm_df, use_container_width=True, height=min(40 * max(len(confirm_df), 1) + 38, 400))
+            st.success(f"🎯 {len(confirmation_rows)} trade(s) ready for entry with confirmed bias!")
         else:
-            st.info("No high-confidence bearish setups found.")
-    bullish_count = sum(1 for r in all_results if "BULLISH" in r["verdict"])
-    bearish_count = sum(1 for r in all_results if "BEARISH" in r["verdict"])
-    st.markdown(
-        f'<div style="font-size:10px;color:#6b7099;margin-top:12px;text-align:center">'
-        f'Scanned {len(custom_watchlist)} stocks · {bullish_count} bullish · {bearish_count} bearish · '
-        f'{len(top_bullish)} high-conf longs · {len(top_bearish)} high-conf shorts'
-        f'</div>',
-        unsafe_allow_html=True
-    )
+            st.info("⏳ No trades with confirmed bias yet. Check again in a moment...")
 
 # ── Sector Scan ──────────────────────────────────────
 if sector_scan_btn:
@@ -3304,7 +6075,7 @@ if sector_scan_btn:
                     for rank, r in enumerate(bullish_hot, 1):
                         stop_html = f'<span style="color:#ff4d6a">${r["stop_loss"]}</span>' if r.get("stop_loss") else "N/A"
                         t1_html = f'<span style="color:#00e5a0">${r["target1"]}</span>' if r.get("target1") else "N/A"
-                        t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}d</span>' if r.get("t1_days") else ""
+                        t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}td</span>' if r.get("t1_days") else ""
                         val_color = r.get("valuation_color", "#6b7099")
                         
                         st.markdown(
@@ -3337,7 +6108,7 @@ if sector_scan_btn:
                     for rank, r in enumerate(bearish_hot, 1):
                         stop_html = f'<span style="color:#ff4d6a">${r["stop_loss"]}</span>' if r.get("stop_loss") else "N/A"
                         t1_html = f'<span style="color:#00e5a0">${r["target1"]}</span>' if r.get("target1") else "N/A"
-                        t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}d</span>' if r.get("t1_days") else ""
+                        t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}td</span>' if r.get("t1_days") else ""
                         val_color = r.get("valuation_color", "#6b7099")
                         
                         st.markdown(
@@ -3415,7 +6186,7 @@ if sector_scan_btn:
                 for rank, r in enumerate(top_bullish, 1):
                     stop_html = f'<span style="color:#ff4d6a">${r["stop_loss"]}</span>' if r.get("stop_loss") else "N/A"
                     t1_html = f'<span style="color:#00e5a0">${r["target1"]}</span>' if r.get("target1") else "N/A"
-                    t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}d</span>' if r.get("t1_days") else ""
+                    t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}td</span>' if r.get("t1_days") else ""
                     val_color = r.get("valuation_color", "#6b7099")
                     
                     st.markdown(
@@ -3449,7 +6220,7 @@ if sector_scan_btn:
                 for rank, r in enumerate(top_bearish, 1):
                     stop_html = f'<span style="color:#ff4d6a">${r["stop_loss"]}</span>' if r.get("stop_loss") else "N/A"
                     t1_html = f'<span style="color:#00e5a0">${r["target1"]}</span>' if r.get("target1") else "N/A"
-                    t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}d</span>' if r.get("t1_days") else ""
+                    t1_time = f'<span style="color:#4d9fff">~{r["t1_days"]}td</span>' if r.get("t1_days") else ""
                     val_color = r.get("valuation_color", "#6b7099")
                     
                     st.markdown(
@@ -3477,6 +6248,45 @@ if sector_scan_btn:
             unsafe_allow_html=True
         )
     
+
+# ── Macro Dashboard ──────────────────────────────────
+with tab_macro:
+    st.markdown(
+        '<div style="background:linear-gradient(135deg,#0a0b14,#131625);border:1px solid #1a1d2e;'
+        'border-radius:8px;padding:18px 24px;margin-bottom:16px">'
+        '<div style="display:flex;align-items:center;gap:12px">'
+        '<div style="font-size:28px">🌍</div>'
+        '<div>'
+        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Macro Dashboard</div>'
+        '<div style="font-size:10px;color:#6b7099">Live market context — indices, volatility, commodities, bonds. '
+        'Refreshes every 5 minutes. Requires yfinance.</div>'
+        '</div></div></div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("🔄 Refresh Macro Data", use_container_width=True, key="btn_macro_refresh"):
+        get_macro_snapshot.clear()
+        get_sector_performance.clear()
+
+    with st.spinner("Fetching macro data..."):
+        macro_data = get_macro_snapshot()
+
+    # Sector strength — prefer scan-derived (more granular), fall back to ETF momentum
+    last_scan = st.session_state.get("_last_scan_results", [])
+    scan_sector_str = _sector_strength_from_scan(last_scan) if last_scan else None
+
+    etf_perf = None
+    if not scan_sector_str:
+        with st.spinner("Fetching sector ETF data..."):
+            try:
+                etf_perf = get_sector_performance(api_key, api_secret, data_source)
+            except Exception:
+                etf_perf = None
+
+    _render_macro_dashboard(macro_data, sector_str=scan_sector_str, etf_sector_perf=etf_perf)
+
+    if last_scan:
+        st.caption(f"Sector strength sourced from last Stock Analysis scan ({len(last_scan)} tickers). Re-run scan to update.")
+
 
 # ── Fetch earnings data ──────────────────────────────
 end_date   = date.today()
@@ -3558,19 +6368,35 @@ if fetch_btn:
         status.info("⏱ Fetching hourly bars for 4H candle analysis…")
         hourly_start = end_date - timedelta(days=14)  # Last 14 days for display
         hourly_data_delay = None
+        hourly_source_used = None
+        hourly_df = pd.DataFrame()  # Initialize empty
         try:
-            if data_source == "Alpaca":
-                hourly_df = get_hourly_bars_alpaca(symbol, str(hourly_start), str(end_date), api_key, api_secret)
-            else:
-                hourly_df = get_hourly_bars(symbol, str(hourly_start), str(end_date), api_key)
+            # Try yfinance first (consolidated data, matches TOS/ThinkorSwim)
+            if YFINANCE_AVAILABLE:
+                hourly_df = get_hourly_bars_yfinance(symbol, str(hourly_start), str(end_date))
+                if not hourly_df.empty:
+                    hourly_source_used = "Yahoo Finance"
+                    print(f"[HOURLY] {symbol}: Using Yahoo Finance ({len(hourly_df)} bars)")
+                else:
+                    print(f"[HOURLY] {symbol}: yfinance returned empty, trying fallback")
+            
+            # Fallback to Alpaca/Polygon if yfinance failed
+            if hourly_df is None or hourly_df.empty:
+                if data_source == "Alpaca":
+                    hourly_df = get_hourly_bars_alpaca(symbol, str(hourly_start), str(end_date), api_key, api_secret)
+                else:
+                    hourly_df = get_hourly_bars(symbol, str(hourly_start), str(end_date), api_key)
+                if not hourly_df.empty:
+                    hourly_source_used = f"{source_name} (IEX)"
+            
             if hourly_df.empty:
-                st.sidebar.warning(f"⚠️ No hourly data returned from {source_name}")
+                st.sidebar.warning(f"⚠️ No hourly data returned")
             else:
                 # Show what data we actually got
                 actual_start = hourly_df.index.min()
                 actual_end = hourly_df.index.max()
                 hourly_data_delay = (date.today() - actual_end.date()).days
-                st.sidebar.info(f"📊 Hourly data: {actual_start.date()} to {actual_end.date()}")
+                st.sidebar.info(f"📊 Hourly data: {actual_start.date()} to {actual_end.date()} ({hourly_source_used})")
                 if hourly_data_delay > 1 and data_source == "Polygon":
                     st.sidebar.warning(f"⚠️ Polygon free tier: hourly data is {hourly_data_delay} days behind")
         except Exception as e:
@@ -3668,8 +6494,8 @@ if fetch_btn:
       now_et = datetime.now(ZoneInfo("America/New_York"))
       today = date.today()
     
-      # 4H candle completes at 1:30 PM ET (13:30)
-      candle_complete_time = now_et.replace(hour=13, minute=30, second=0, microsecond=0)
+      # 4H candle completes at 1:00 PM ET (13:00)
+      candle_complete_time = now_et.replace(hour=13, minute=0, second=0, microsecond=0)
       is_after_candle_close = now_et >= candle_complete_time
       is_market_day = now_et.weekday() < 5  # Mon-Fri
     
@@ -3709,6 +6535,7 @@ if fetch_btn:
     
       if candle_4h:
           candle_change = (candle_4h["close"] - candle_4h["open"]) / candle_4h["open"] * 100
+          print(f"[4H CANDLE] {symbol} date={candle_date} status={candle_status} O={candle_4h['open']:.2f} C={candle_4h['close']:.2f} change={candle_change:+.2f}% bars={candle_4h.get('bars','?')}")
           if candle_4h["close"] > candle_4h["open"]:
               candle_4h_bias = "BULLISH"
               candle_4h_color = "#00e5a0"
@@ -4003,7 +6830,28 @@ if fetch_btn:
       with col2:
           st.metric("Fibonacci Bias", fib_bias, bias_desc[:30])
       with col3:
+          candle_time_cst = ""
+          if candle_4h and "first_bar_ts" in candle_4h:
+              from zoneinfo import ZoneInfo
+              first_ts = candle_4h["first_bar_ts"]
+              last_ts = candle_4h["last_bar_ts"]
+              if hasattr(first_ts, 'tz') and first_ts.tz is not None:
+                  first_cst = first_ts.astimezone(ZoneInfo("America/Chicago"))
+                  last_cst = last_ts.astimezone(ZoneInfo("America/Chicago"))
+              else:
+                  # Assume ET, convert to CST (subtract 1 hour)
+                  import pytz
+                  et = pytz.timezone("America/New_York")
+                  first_cst = et.localize(first_ts.to_pydatetime()).astimezone(ZoneInfo("America/Chicago"))
+                  last_cst = et.localize(last_ts.to_pydatetime()).astimezone(ZoneInfo("America/Chicago"))
+              last_cst_end = last_cst + timedelta(hours=1)  # bar timestamp is start; add 1h for candle close
+              bars_count = candle_4h.get("bars", "?")
+              candle_time_cst = f"{first_cst.strftime('%m/%d %I:%M %p')} – {last_cst_end.strftime('%I:%M %p')} CST ({bars_count}/4 bars)"
           st.metric("4H Candle Bias", candle_4h_bias, candle_4h_desc[:35])
+          if candle_time_cst:
+              st.caption(f"🕐 {candle_time_cst}")
+          if candle_4h and candle_date is not None:
+              st.caption(f"O: {candle_4h['open']:.2f}  H: {candle_4h['high']:.2f}  L: {candle_4h['low']:.2f}  C: {candle_4h['close']:.2f}")
       with col4:
           st.metric("Nearest Fib Level", nearest_name, f"${nearest_price:.2f} ({nearest_dist:.1f}% away)")
     
@@ -4056,10 +6904,10 @@ if fetch_btn:
           with esl_col2:
               st.metric("Stop Loss", f"${stop_loss:.2f}", f"Risk: {risk_pct}%")
           with esl_col3:
-              t1_time = f"~{t1_days}d" if t1_days else ""
+              t1_time = f"~{t1_days} trading days" if t1_days else ""
               st.metric("Target 1 (2:1)", f"${target1:.2f}", t1_time)
           with esl_col4:
-              t2_time = f"~{t2_days}d" if t2_days else ""
+              t2_time = f"~{t2_days} trading days" if t2_days else ""
               st.metric("Target 2 (3:1)", f"${target2:.2f}", t2_time)
 
           st.markdown(
@@ -4075,6 +6923,40 @@ if fetch_btn:
               f'</div>',
               unsafe_allow_html=True
           )
+
+          # ── Track Trade Button ──
+          # Store trade data in session state so the save can work across reruns
+          track_key = f"track_{symbol}_{_sym_idx}"
+          _trade_payload = {
+              "ticker": symbol, "direction": setup_dir, "entry_price": entry,
+              "stop_loss": stop_loss, "target1": target1, "target2": target2,
+              "verdict": final_verdict, "confidence": confidence, "score": score,
+              "signals": ", ".join(f"{nm}: {val}" for nm, val, _, _ in signal_details),
+              "t1_days": t1_days, "t2_days": t2_days,
+          }
+          st.session_state[f"_trade_data_{track_key}"] = _trade_payload
+
+          track_notes = st.text_input("Trade notes (optional)", key=f"notes_{track_key}",
+                                      placeholder="e.g. Earnings play, breakout setup…")
+
+          def _save_tracked_trade(tkey):
+              """Callback to save trade from session state data."""
+              payload = st.session_state.get(f"_trade_data_{tkey}")
+              if payload:
+                  notes = st.session_state.get(f"notes_{tkey}", "")
+                  save_trade(**payload, notes=notes if notes else None)
+                  st.session_state[f"_trade_saved_{tkey}"] = True
+
+          st.button(
+              f"📌 Track This Trade — {setup_dir} {symbol} @ ${entry:.2f}",
+              key=track_key,
+              on_click=_save_tracked_trade,
+              args=(track_key,),
+          )
+          if st.session_state.get(f"_trade_saved_{track_key}"):
+              st.success(f"✅ Trade saved! {setup_dir} {symbol} @ ${entry:.2f} · "
+                        f"Stop ${stop_loss:.2f} · T1 ${target1:.2f} · T2 ${target2:.2f}")
+              del st.session_state[f"_trade_saved_{track_key}"]
       else:
           st.info("No directional signal — Entry/Stop/Target levels require a BULLISH or BEARISH verdict.")
 
@@ -4315,7 +7197,7 @@ if fetch_btn:
       if candle_4h:
           date_label = f"{candle_date}" if candle_date else "N/A"
           status_emoji = "✅" if candle_status == "COMPLETE" else ("⏳" if candle_status == "IN PROGRESS" else "📅")
-          st.markdown(f"#### ⏱ 4H Candle (9:30 AM - 1:30 PM ET) · {status_emoji} {candle_status} · {date_label}")
+          st.markdown(f"#### ⏱ 4H Candle (9:00 AM - 1:00 PM ET) · {status_emoji} {candle_status} · {date_label}")
           c4h_col1, c4h_col2, c4h_col3, c4h_col4 = st.columns(4)
           with c4h_col1:
               st.metric("Open", f"${candle_4h['open']:.2f}")
@@ -4330,7 +7212,7 @@ if fetch_btn:
           if candle_status == "IN PROGRESS":
               time_remaining = candle_complete_time - now_et
               mins_remaining = int(time_remaining.total_seconds() // 60)
-              status_msg = f"⏳ Candle forming · ~{mins_remaining} min until 1:30 PM ET"
+              status_msg = f"⏳ Candle forming · ~{mins_remaining} min until 1:00 PM ET"
           elif candle_status == "COMPLETE":
               status_msg = f"✅ Today's candle complete"
           else:
@@ -4366,7 +7248,7 @@ if fetch_btn:
                       unsafe_allow_html=True
                   )
       else:
-          st.markdown("#### ⏱ 4H Candle (9:30 AM - 1:30 PM ET)")
+          st.markdown("#### ⏱ 4H Candle (9:00 AM - 1:00 PM ET)")
         
           # Debug info
           hourly_info = []
@@ -4813,16 +7695,17 @@ if fetch_btn:
       earn_df = earn_df.sort_values("Report Date", ascending=False).reset_index(drop=True)
       st.dataframe(earn_df, use_container_width=True, height=250)
     
-      st.info("👆 Review the analysis above, then click **▶ RUN BACKTEST** to run the strategy.")
+      # st.info("👆 Review the analysis above, then click **▶ RUN BACKTEST** to run the strategy.")
 
-# ── Run backtest ─────────────────────────────────────
-if run_btn:
-  with tab_fetch:
-    if st.session_state.fetched_data is None:
-        st.warning("Please click **📅 FETCH EARNINGS** first to load earnings data.")
+# # ── Run backtest (COMMENTED OUT — moved to Backtest tab) ─────────────────────
+# if run_btn:
+#   with tab_fetch:
+#     if st.session_state.fetched_data is None:
+#         st.warning("Please click **📅 FETCH EARNINGS** first to load earnings data.")
 
-if run_btn and st.session_state.fetched_data is not None:
-  with tab_fetch:
+if False:  # Earnings Analysis backtest commented out — use the Backtest tab instead
+  # if run_btn and st.session_state.fetched_data is not None:
+  #   with tab_fetch:
     # Load from session state
     data = st.session_state.fetched_data
     symbol = data["symbol"]
@@ -5372,3 +8255,632 @@ if run_btn and st.session_state.fetched_data is not None:
         '</div>',
         unsafe_allow_html=True,
     )
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ TAB 5: TRADE TRACKER                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+with tab_trades:
+    st.markdown(
+        '<div style="background:linear-gradient(135deg,#0a0b14,#131625);border:1px solid #1a1d2e;'
+        'border-radius:8px;padding:18px 24px;margin-bottom:16px">'
+        '<div style="display:flex;align-items:center;gap:12px">'
+        '<div style="font-size:28px">📋</div>'
+        '<div>'
+        '<div style="font-size:16px;font-weight:700;color:#e8ecff">Trade Tracker</div>'
+        '<div style="font-size:10px;color:#6b7099">Track your trades, monitor targets, and review performance. '
+        'Trades are saved locally in a SQLite database.</div>'
+        '</div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Refresh open trades: check current prices against targets ──
+    all_trades = get_all_trades()
+    open_trades = [t for t in all_trades if t["status"] == "OPEN"]
+    closed_trades = [t for t in all_trades if t["status"] == "CLOSED"]
+
+    # ── Stats Summary ──
+    if all_trades:
+        total_trades = len(all_trades)
+        n_open = len(open_trades)
+        n_closed = len(closed_trades)
+        n_wins = sum(1 for t in closed_trades if t.get("outcome") == "WIN")
+        n_losses = sum(1 for t in closed_trades if t.get("outcome") == "LOSS")
+        win_rate = (n_wins / n_closed * 100) if n_closed > 0 else 0
+        avg_pnl = sum(t.get("pnl_pct", 0) for t in closed_trades) / n_closed if n_closed > 0 else 0
+        total_pnl = sum(t.get("pnl_pct", 0) for t in closed_trades)
+        t1_hits = sum(1 for t in all_trades if t.get("t1_hit"))
+        t2_hits = sum(1 for t in all_trades if t.get("t2_hit"))
+        stop_hits = sum(1 for t in all_trades if t.get("stop_hit"))
+
+        st_col1, st_col2, st_col3, st_col4, st_col5 = st.columns(5)
+        with st_col1:
+            st.metric("Total Trades", total_trades, f"{n_open} open")
+        with st_col2:
+            wr_delta = f"{n_wins}W / {n_losses}L"
+            st.metric("Win Rate", f"{win_rate:.0f}%", wr_delta)
+        with st_col3:
+            pnl_color = "normal" if total_pnl >= 0 else "inverse"
+            st.metric("Total P&L", f"{total_pnl:+.1f}%", f"avg {avg_pnl:+.1f}%", delta_color=pnl_color)
+        with st_col4:
+            st.metric("T1 Hits", t1_hits, f"of {total_trades}")
+        with st_col5:
+            st.metric("T2 Hits", t2_hits, f"stops: {stop_hits}")
+
+    # ── Check Targets Button ──
+    if open_trades:
+        st.markdown("---")
+        st.markdown("### 📡 Open Positions")
+        if st.button("🔄 Check All Targets (Live Prices)", key="check_targets_btn"):
+            progress = st.progress(0)
+            status_text = st.empty()
+            for idx, trade in enumerate(open_trades):
+                tkr = trade["ticker"]
+                status_text.text(f"Checking {tkr}...")
+                progress.progress((idx + 1) / len(open_trades))
+                try:
+                    if YFINANCE_AVAILABLE:
+                        stock = yf.Ticker(tkr)
+                        hist = stock.history(period="1mo")
+                        if not hist.empty:
+                            current = float(hist["Close"].iloc[-1])
+                            entry_dt = trade["entry_date"]
+                            # Filter history since entry date
+                            since_entry = hist[hist.index >= pd.Timestamp(entry_dt)]
+                            if not since_entry.empty:
+                                hi = float(since_entry["High"].max())
+                                lo = float(since_entry["Low"].min())
+                            else:
+                                hi = float(hist["High"].max())
+                                lo = float(hist["Low"].min())
+                            updates = check_trade_targets(trade, current, hi, lo)
+                            if updates:
+                                update_trade(trade["id"], **updates)
+                except Exception:
+                    pass
+            status_text.empty()
+            progress.empty()
+            st.success("✅ All open trades checked against live prices!")
+            st.rerun()
+
+        # ── Open Trades Table ──
+        for trade in open_trades:
+            tid = trade["id"]
+            tkr = trade["ticker"]
+            direction = trade["direction"]
+            dir_color = "#00e5a0" if direction == "LONG" else "#ff4d6a"
+            dir_emoji = "🟢" if direction == "LONG" else "🔴"
+            entry_px = trade["entry_price"]
+            stop_px = trade.get("stop_loss")
+            t1_px = trade.get("target1")
+            t2_px = trade.get("target2")
+            t1_hit = "✅" if trade.get("t1_hit") else "⬜"
+            t2_hit = "✅" if trade.get("t2_hit") else "⬜"
+            stop_hit_flag = "🛑" if trade.get("stop_hit") else ""
+            hi_since = trade.get("high_since_entry")
+            lo_since = trade.get("low_since_entry")
+            e_date = trade.get("entry_date", "")
+            notes = trade.get("notes", "") or ""
+            confidence = trade.get("confidence", "")
+            signals = trade.get("signals", "")
+            t1d = trade.get("t1_trading_days")
+            t2d = trade.get("t2_trading_days")
+
+            # Calculate trading days elapsed
+            try:
+                entry_date_obj = datetime.strptime(e_date, "%Y-%m-%d").date()
+                days_elapsed = sum(1 for d in range((date.today() - entry_date_obj).days + 1)
+                                   if (entry_date_obj + timedelta(days=d)).weekday() < 5) - 1
+                days_str = f"{days_elapsed} td"
+            except Exception:
+                days_str = "?"
+                days_elapsed = 0
+
+            # P&L estimate
+            if hi_since and lo_since:
+                if direction == "LONG":
+                    unrealized = round((hi_since - entry_px) / entry_px * 100, 1) if hi_since else 0
+                    pnl_str = f"High: ${hi_since:.2f} ({unrealized:+.1f}%)"
+                else:
+                    unrealized = round((entry_px - lo_since) / entry_px * 100, 1) if lo_since else 0
+                    pnl_str = f"Low: ${lo_since:.2f} ({unrealized:+.1f}%)"
+                pnl_color = "#00e5a0" if unrealized > 0 else "#ff4d6a"
+            else:
+                pnl_str = "Check targets to update"
+                pnl_color = "#6b7099"
+                unrealized = 0
+
+            # Time estimate status
+            time_status = ""
+            if t1d and days_elapsed > 0:
+                if days_elapsed > t1d and not trade.get("t1_hit"):
+                    time_status = f' · ⚠️ Past T1 estimate ({t1d}td)'
+                elif days_elapsed <= t1d:
+                    time_status = f' · ⏳ {t1d - days_elapsed}td to T1 est.'
+
+            st.markdown(
+                f'<div style="background:#0d0f17;border:1px solid {dir_color}40;'
+                f'border-radius:8px;padding:16px;margin-bottom:12px">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+                f'<div>'
+                f'<span style="font-size:18px;font-weight:800;color:#e8ecff">{dir_emoji} {tkr}</span>'
+                f'<span style="font-size:11px;color:{dir_color};font-weight:700;margin-left:10px">{direction}</span>'
+                f'<span style="font-size:10px;color:#6b7099;margin-left:10px">#{tid} · {e_date} · {days_str}{time_status}</span>'
+                f'</div>'
+                f'<div style="font-size:10px;color:#6b7099">{stop_hit_flag} {confidence}</div>'
+                f'</div>'
+                f'<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px">'
+                f'<div style="background:#090b13;padding:8px 14px;border-radius:4px">'
+                f'<div style="font-size:9px;color:#6b7099">ENTRY</div>'
+                f'<div style="font-size:14px;color:#e8ecff;font-weight:700">${entry_px:.2f}</div></div>'
+                f'<div style="background:#090b13;padding:8px 14px;border-radius:4px">'
+                f'<div style="font-size:9px;color:#ff4d6a">STOP</div>'
+                f'<div style="font-size:14px;color:#ff4d6a;font-weight:700">'
+                f'{"$" + f"{stop_px:.2f}" if stop_px else "N/A"}</div></div>'
+                f'<div style="background:#090b13;padding:8px 14px;border-radius:4px;'
+                f'{"border:1px solid #00e5a060" if trade.get("t1_hit") else ""}">'
+                f'<div style="font-size:9px;color:#00e5a0">TARGET 1 {t1_hit}</div>'
+                f'<div style="font-size:14px;color:#00e5a0;font-weight:700">'
+                f'{"$" + f"{t1_px:.2f}" if t1_px else "N/A"}</div></div>'
+                f'<div style="background:#090b13;padding:8px 14px;border-radius:4px;'
+                f'{"border:1px solid #00e5a060" if trade.get("t2_hit") else ""}">'
+                f'<div style="font-size:9px;color:#00e5a0">TARGET 2 {t2_hit}</div>'
+                f'<div style="font-size:14px;color:#00e5a0;font-weight:700">'
+                f'{"$" + f"{t2_px:.2f}" if t2_px else "N/A"}</div></div>'
+                f'<div style="background:#090b13;padding:8px 14px;border-radius:4px">'
+                f'<div style="font-size:9px;color:{pnl_color}">UNREALIZED</div>'
+                f'<div style="font-size:11px;color:{pnl_color};font-weight:600">{pnl_str}</div></div>'
+                f'</div>'
+                f'{"<div style=" + chr(34) + "font-size:10px;color:#6b7099;margin-top:4px" + chr(34) + ">" + signals + "</div>" if signals else ""}'
+                f'{"<div style=" + chr(34) + "font-size:10px;color:#a78bfa;margin-top:4px" + chr(34) + ">📝 " + notes + "</div>" if notes else ""}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Close Trade controls
+            close_col1, close_col2, close_col3 = st.columns([2, 1, 1])
+            with close_col1:
+                exit_px = st.number_input(f"Exit price", min_value=0.01, value=float(entry_px),
+                                          step=0.01, key=f"exit_px_{tid}")
+            with close_col2:
+                if st.button(f"✅ Close Trade", key=f"close_{tid}"):
+                    close_trade(tid, exit_px)
+                    st.success(f"Trade #{tid} {tkr} closed @ ${exit_px:.2f}")
+                    st.rerun()
+            with close_col3:
+                if st.button(f"🗑️ Delete", key=f"del_{tid}"):
+                    delete_trade(tid)
+                    st.warning(f"Trade #{tid} deleted.")
+                    st.rerun()
+    else:
+        if not all_trades:
+            st.info("No trades tracked yet. Go to **📅 Stock Analysis (with Options)**, fetch a stock, and click **📌 Track This Trade** to get started.")
+        else:
+            st.success("No open positions. All trades have been closed.")
+
+    # ── Closed Trades History ──
+    if closed_trades:
+        st.markdown("---")
+        st.markdown("### 📊 Trade History")
+
+        hist_data = []
+        for t in closed_trades:
+            pnl = t.get("pnl_pct", 0)
+            pnl_color_class = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
+            hist_data.append({
+                "ID": t["id"],
+                "Ticker": t["ticker"],
+                "Dir": t["direction"],
+                "Entry": f"${t['entry_price']:.2f}",
+                "Exit": f"${t['exit_price']:.2f}" if t.get("exit_price") else "—",
+                "P&L": f"{pnl:+.1f}%",
+                "Outcome": t.get("outcome", "—"),
+                "T1 Hit": "✅" if t.get("t1_hit") else "❌",
+                "T2 Hit": "✅" if t.get("t2_hit") else "❌",
+                "Stop Hit": "🛑" if t.get("stop_hit") else "—",
+                "Entry Date": t.get("entry_date", ""),
+                "Exit Date": t.get("exit_date", ""),
+                "Signals": t.get("signals", "")[:40],
+            })
+
+        hist_df = pd.DataFrame(hist_data)
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+        # ── Performance Breakdown ──
+        if len(closed_trades) >= 2:
+            perf_col1, perf_col2 = st.columns(2)
+
+            with perf_col1:
+                # Cumulative P&L chart
+                cum_pnl = []
+                running = 0
+                for t in reversed(closed_trades):
+                    running += t.get("pnl_pct", 0)
+                    cum_pnl.append({"Date": t.get("exit_date", ""), "P&L %": round(running, 2)})
+                cum_df = pd.DataFrame(cum_pnl)
+                fig = px.line(cum_df, x="Date", y="P&L %", title="Cumulative P&L %")
+                fig.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    height=300,
+                    margin=dict(l=40, r=20, t=40, b=30),
+                )
+                fig.update_traces(line_color="#00e5a0" if running >= 0 else "#ff4d6a")
+                st.plotly_chart(fig, use_container_width=True)
+
+            with perf_col2:
+                # Win/Loss pie
+                outcomes = {"WIN": n_wins, "LOSS": n_losses,
+                            "BREAKEVEN": sum(1 for t in closed_trades if t.get("outcome") == "BREAKEVEN")}
+                outcomes = {k: v for k, v in outcomes.items() if v > 0}
+                if outcomes:
+                    fig2 = px.pie(
+                        names=list(outcomes.keys()),
+                        values=list(outcomes.values()),
+                        title="Outcomes",
+                        color_discrete_map={"WIN": "#00e5a0", "LOSS": "#ff4d6a", "BREAKEVEN": "#f5c842"},
+                    )
+                    fig2.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        height=300,
+                        margin=dict(l=20, r=20, t=40, b=30),
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+
+            # Target accuracy
+            st.markdown("#### 🎯 Target Accuracy")
+            acc_col1, acc_col2, acc_col3 = st.columns(3)
+            with acc_col1:
+                t1_rate = sum(1 for t in closed_trades if t.get("t1_hit")) / n_closed * 100
+                st.metric("T1 Hit Rate", f"{t1_rate:.0f}%",
+                          f"{sum(1 for t in closed_trades if t.get('t1_hit'))}/{n_closed}")
+            with acc_col2:
+                t2_rate = sum(1 for t in closed_trades if t.get("t2_hit")) / n_closed * 100
+                st.metric("T2 Hit Rate", f"{t2_rate:.0f}%",
+                          f"{sum(1 for t in closed_trades if t.get('t2_hit'))}/{n_closed}")
+            with acc_col3:
+                stop_rate = sum(1 for t in closed_trades if t.get("stop_hit")) / n_closed * 100
+                st.metric("Stop Hit Rate", f"{stop_rate:.0f}%",
+                          f"{sum(1 for t in closed_trades if t.get('stop_hit'))}/{n_closed}")
+
+    # ── Manual Trade Entry ──
+    st.markdown("---")
+    st.markdown("### ✏️ Add Trade Manually")
+    with st.expander("Enter trade details", expanded=False):
+        m_col1, m_col2, m_col3 = st.columns(3)
+        with m_col1:
+            m_ticker = st.text_input("Ticker", key="manual_ticker", placeholder="AAPL")
+            m_direction = st.selectbox("Direction", ["LONG", "SHORT"], key="manual_dir")
+        with m_col2:
+            m_entry = st.number_input("Entry Price", min_value=0.01, value=100.0, step=0.01, key="manual_entry")
+            m_stop = st.number_input("Stop Loss", min_value=0.0, value=0.0, step=0.01, key="manual_stop")
+        with m_col3:
+            m_t1 = st.number_input("Target 1", min_value=0.0, value=0.0, step=0.01, key="manual_t1")
+            m_t2 = st.number_input("Target 2", min_value=0.0, value=0.0, step=0.01, key="manual_t2")
+        m_notes = st.text_input("Notes", key="manual_notes", placeholder="Optional notes…")
+        if st.button("💾 Save Manual Trade", key="save_manual_trade"):
+            if m_ticker.strip():
+                save_trade(
+                    ticker=m_ticker.strip().upper(),
+                    direction=m_direction,
+                    entry_price=m_entry,
+                    stop_loss=m_stop if m_stop > 0 else None,
+                    target1=m_t1 if m_t1 > 0 else None,
+                    target2=m_t2 if m_t2 > 0 else None,
+                    notes=m_notes if m_notes else None,
+                )
+                st.success(f"✅ Saved {m_direction} {m_ticker.strip().upper()} @ ${m_entry:.2f}")
+                st.rerun()
+            else:
+                st.warning("Please enter a ticker symbol.")
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║ TAB 6: MY HOLDINGS                                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+with tab_holdings:
+    st.markdown(
+        '<div style="background:linear-gradient(135deg,#0a0b14,#131625);border:1px solid #1a1d2e;'
+        'border-radius:8px;padding:18px 24px;margin-bottom:16px">'
+        '<div style="font-size:18px;font-weight:bold;color:#e8ecff;margin-bottom:4px">💼 My Holdings</div>'
+        '<div style="font-size:10px;color:#6b7099">Track your portfolio positions with live technical analysis, '
+        'targets, and stop-loss levels.</div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+    # ── Add New Holding ──
+    st.markdown("#### ➕ Add Holding")
+    h_col1, h_col2, h_col3 = st.columns(3)
+    with h_col1:
+        h_ticker = st.text_input("Ticker", key="hold_ticker", placeholder="e.g. AAPL")
+    with h_col2:
+        h_qty = st.number_input("Quantity", min_value=0.01, value=1.0, step=1.0, key="hold_qty")
+    with h_col3:
+        h_avg = st.number_input("Avg Cost ($)", min_value=0.01, value=100.0, step=0.01, key="hold_avg")
+    h_notes = st.text_input("Notes (optional)", key="hold_notes", placeholder="e.g. Long-term hold")
+    if st.button("💾 Add Holding", key="add_holding_btn"):
+        if h_ticker.strip():
+            save_holding(h_ticker, h_qty, h_avg, h_notes if h_notes else None)
+            st.success(f"✅ Added {h_qty} shares of {h_ticker.strip().upper()} @ ${h_avg:.2f}")
+            st.rerun()
+        else:
+            st.warning("Please enter a ticker symbol.")
+
+    # ── Import / Export ──
+    st.markdown("---")
+    imp_col, exp_col = st.columns(2)
+    with imp_col:
+        st.markdown("#### 📥 Import Holdings")
+        uploaded = st.file_uploader("Upload CSV or Excel (columns: ticker, quantity, avg_cost, notes)",
+                                    type=["csv", "xlsx", "xls"], key="import_holdings_file")
+        if uploaded is not None:
+            try:
+                if uploaded.name.endswith(".csv"):
+                    imp_df = pd.read_csv(uploaded)
+                else:
+                    imp_df = pd.read_excel(uploaded)
+                # Normalize column names
+                imp_df.columns = [c.strip().lower().replace(" ", "_") for c in imp_df.columns]
+                required = {"ticker", "quantity", "avg_cost"}
+                if not required.issubset(set(imp_df.columns)):
+                    st.error(f"Missing columns. Need: ticker, quantity, avg_cost. Got: {list(imp_df.columns)}")
+                else:
+                    imported = 0
+                    for _, row in imp_df.iterrows():
+                        t = str(row["ticker"]).strip().upper()
+                        q = float(row["quantity"])
+                        a = float(row["avg_cost"])
+                        n = str(row.get("notes", "")).strip() if "notes" in imp_df.columns and pd.notna(row.get("notes")) else None
+                        if t and q > 0 and a > 0:
+                            save_holding(t, q, a, n)
+                            imported += 1
+                    st.success(f"✅ Imported {imported} holdings!")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Import error: {e}")
+    with exp_col:
+        st.markdown("#### 📤 Export Holdings")
+        current_holdings = get_holdings()
+        if current_holdings:
+            exp_df = pd.DataFrame(current_holdings)[["ticker", "quantity", "avg_cost", "notes", "added_date"]]
+            # CSV download
+            csv_data = exp_df.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download as CSV", csv_data, "my_holdings.csv", "text/csv", key="exp_csv")
+            # Excel download
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                exp_df.to_excel(writer, index=False, sheet_name="Holdings")
+            st.download_button("⬇️ Download as Excel", excel_buf.getvalue(), "my_holdings.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="exp_xlsx")
+        else:
+            st.info("No holdings to export.")
+
+    st.markdown("---")
+
+    # ── Current Holdings ──
+    holdings = get_holdings()
+    if not holdings:
+        st.info("No holdings yet. Add your first position above.")
+    else:
+        # Analyze button
+        analyze_btn = st.button("🔍 Analyze All Holdings", key="analyze_holdings_btn")
+
+        # Portfolio summary header
+        st.markdown("#### 📊 Portfolio Positions")
+
+        # Analyze holdings when button clicked
+        if analyze_btn:
+            analysis_results = {}
+            progress = st.progress(0)
+            for idx, h in enumerate(holdings):
+                progress.progress((idx + 1) / len(holdings))
+                result = scan_single_stock(h["ticker"], api_key, api_secret, data_source)
+                if result:
+                    analysis_results[h["ticker"]] = result
+            progress.empty()
+            st.session_state["_holdings_analysis"] = analysis_results
+
+        analysis = st.session_state.get("_holdings_analysis", {})
+
+        total_invested = 0.0
+        total_current = 0.0
+
+        # Build per-holding data with analysis
+        holdings_data = []
+        for h in holdings:
+            ticker = h["ticker"]
+            qty = h["quantity"]
+            avg_cost = h["avg_cost"]
+            cost_basis = qty * avg_cost
+            total_invested += cost_basis
+
+            a = analysis.get(ticker)
+            current_price = a["price"] if a else None
+
+            if current_price:
+                market_val = qty * current_price
+                total_current += market_val
+                pnl = market_val - cost_basis
+                pnl_pct = (current_price - avg_cost) / avg_cost * 100
+                pnl_color = "#00e5a0" if pnl >= 0 else "#ff4d6a"
+                pnl_sign = "+" if pnl >= 0 else ""
+            else:
+                market_val = cost_basis
+                total_current += market_val
+                pnl = 0
+                pnl_pct = 0
+                pnl_color = "#6b7099"
+                pnl_sign = ""
+
+            # Determine category
+            if a:
+                verdict = a["verdict"]
+                if "BULLISH" in verdict:
+                    category = "bullish"
+                elif "BEARISH" in verdict:
+                    category = "bearish"
+                else:
+                    category = "neutral"
+            else:
+                category = "unanalyzed"
+
+            holdings_data.append({
+                "h": h, "ticker": ticker, "qty": qty, "avg_cost": avg_cost,
+                "cost_basis": cost_basis, "market_val": market_val, "current_price": current_price,
+                "pnl": pnl, "pnl_pct": pnl_pct, "pnl_color": pnl_color, "pnl_sign": pnl_sign,
+                "a": a, "category": category,
+            })
+
+        def _render_holding_card(hd):
+            """Render a single holding card."""
+            ticker = hd["ticker"]
+            qty = hd["qty"]
+            avg_cost = hd["avg_cost"]
+            cost_basis = hd["cost_basis"]
+            market_val = hd["market_val"]
+            current_price = hd["current_price"]
+            pnl = hd["pnl"]
+            pnl_pct = hd["pnl_pct"]
+            pnl_color = hd["pnl_color"]
+            pnl_sign = hd["pnl_sign"]
+            a = hd["a"]
+            h = hd["h"]
+
+            if a:
+                verdict = a["verdict"]
+                confidence = a["confidence"]
+                score = a["score"]
+                signals = a.get("signals", "")
+                if "BULLISH" in verdict:
+                    v_color = "#00e5a0"
+                    v_icon = "🟢"
+                elif "BEARISH" in verdict:
+                    v_color = "#ff4d6a"
+                    v_icon = "🔴"
+                else:
+                    v_color = "#f0c040"
+                    v_icon = "🟡"
+
+                stop_html = f'${a["stop_loss"]:.2f}' if a.get("stop_loss") else "N/A"
+                t1_html = f'${a["target1"]:.2f}' if a.get("target1") else "N/A"
+                t2_html = f'${a["target2"]:.2f}' if a.get("target2") else "N/A"
+                t1_days = f'~{a["t1_days"]}td' if a.get("t1_days") else ""
+
+                analysis_block = (
+                    f'<div style="margin-top:6px;padding:6px;background:#0a0b14;border-radius:4px">'
+                    f'<div style="color:{v_color};font-weight:bold;font-size:11px">{v_icon} {verdict} · {confidence}</div>'
+                    f'<div style="font-size:9px;color:#6b7099;margin-top:2px">Score: {score}</div>'
+                    f'<div style="font-size:9px;color:#6b7099;margin-top:2px">{signals}</div>'
+                    f'<div style="font-size:9px;color:#6b7099;margin-top:4px">'
+                    f'Stop: <span style="color:#ff4d6a">{stop_html}</span> · '
+                    f'T1: <span style="color:#00e5a0">{t1_html}</span> {t1_days} · '
+                    f'T2: <span style="color:#00e5a0">{t2_html}</span>'
+                    f'</div>'
+                    f'</div>'
+                )
+            else:
+                analysis_block = (
+                    '<div style="margin-top:6px;font-size:9px;color:#6b7099;font-style:italic">'
+                    'Click Analyze to see signals</div>'
+                )
+
+            price_display = f'${current_price:.2f}' if current_price else 'N/A'
+
+            st.markdown(
+                f'<div style="background:#0d0f17;border:1px solid #1a1d2e;padding:10px;border-radius:6px;margin-bottom:6px">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                f'<span style="font-size:14px;font-weight:bold;color:#e8ecff">{ticker}</span>'
+                f'<span style="font-size:12px;font-weight:bold;color:{pnl_color}">{pnl_sign}{pnl_pct:.1f}%</span>'
+                f'</div>'
+                f'<div style="font-size:10px;color:#6b7099;margin-top:2px">'
+                f'{qty:.2f} @ ${avg_cost:.2f} → {price_display}'
+                f'</div>'
+                f'<div style="font-size:10px;color:#6b7099">'
+                f'P&L: <span style="color:{pnl_color}">{pnl_sign}${abs(pnl):,.2f}</span> · '
+                f'Cost: ${cost_basis:,.2f} · Val: ${market_val:,.2f}'
+                f'</div>'
+                f'{analysis_block}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+            if st.button("🗑️ Remove", key=f"del_hold_{h['id']}"):
+                delete_holding(h["id"])
+                if "_holdings_analysis" in st.session_state:
+                    st.session_state["_holdings_analysis"].pop(ticker, None)
+                st.rerun()
+
+        # If analysis is available, display in 3 columns by verdict
+        if analysis:
+            bullish_h = [hd for hd in holdings_data if hd["category"] == "bullish"]
+            neutral_h = [hd for hd in holdings_data if hd["category"] in ("neutral", "unanalyzed")]
+            bearish_h = [hd for hd in holdings_data if hd["category"] == "bearish"]
+
+            col_b, col_n, col_r = st.columns(3)
+            with col_b:
+                st.markdown(
+                    '<div style="background:#00e5a015;border:1px solid #00e5a040;padding:10px;border-radius:8px;margin-bottom:10px">'
+                    '<div style="font-size:14px;font-weight:bold;color:#00e5a0">🟢 Bullish</div>'
+                    f'<div style="font-size:10px;color:#6b7099">{len(bullish_h)} position{"s" if len(bullish_h)!=1 else ""}</div>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                if bullish_h:
+                    for hd in bullish_h:
+                        _render_holding_card(hd)
+                else:
+                    st.caption("No bullish positions.")
+
+            with col_n:
+                st.markdown(
+                    '<div style="background:#f0c04015;border:1px solid #f0c04040;padding:10px;border-radius:8px;margin-bottom:10px">'
+                    '<div style="font-size:14px;font-weight:bold;color:#f0c040">🟡 Neutral</div>'
+                    f'<div style="font-size:10px;color:#6b7099">{len(neutral_h)} position{"s" if len(neutral_h)!=1 else ""}</div>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                if neutral_h:
+                    for hd in neutral_h:
+                        _render_holding_card(hd)
+                else:
+                    st.caption("No neutral positions.")
+
+            with col_r:
+                st.markdown(
+                    '<div style="background:#ff4d6a15;border:1px solid #ff4d6a40;padding:10px;border-radius:8px;margin-bottom:10px">'
+                    '<div style="font-size:14px;font-weight:bold;color:#ff4d6a">🔴 Bearish</div>'
+                    f'<div style="font-size:10px;color:#6b7099">{len(bearish_h)} position{"s" if len(bearish_h)!=1 else ""}</div>'
+                    '</div>',
+                    unsafe_allow_html=True
+                )
+                if bearish_h:
+                    for hd in bearish_h:
+                        _render_holding_card(hd)
+                else:
+                    st.caption("No bearish positions.")
+        else:
+            # Not yet analyzed — show flat list
+            for hd in holdings_data:
+                _render_holding_card(hd)
+
+        # Portfolio totals
+        if analysis:
+            total_pnl = total_current - total_invested
+            total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
+            pnl_color = "#00e5a0" if total_pnl >= 0 else "#ff4d6a"
+            pnl_sign = "+" if total_pnl >= 0 else ""
+            st.markdown(
+                f'<div style="background:linear-gradient(135deg,#0a0b14,#131625);border:1px solid #1a1d2e;'
+                f'border-radius:8px;padding:16px;margin-top:12px">'
+                f'<div style="display:flex;justify-content:space-around;text-align:center">'
+                f'<div><div style="font-size:10px;color:#6b7099">TOTAL INVESTED</div>'
+                f'<div style="font-size:16px;font-weight:bold;color:#e8ecff">${total_invested:,.2f}</div></div>'
+                f'<div><div style="font-size:10px;color:#6b7099">CURRENT VALUE</div>'
+                f'<div style="font-size:16px;font-weight:bold;color:#e8ecff">${total_current:,.2f}</div></div>'
+                f'<div><div style="font-size:10px;color:#6b7099">TOTAL P&L</div>'
+                f'<div style="font-size:16px;font-weight:bold;color:{pnl_color}">{pnl_sign}${abs(total_pnl):,.2f} ({pnl_sign}{total_pnl_pct:.1f}%)</div></div>'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )

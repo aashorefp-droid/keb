@@ -8,6 +8,7 @@ Data Sources:
   - Polygon: Free tier has ~7 day delay on hourly bars
 """
 
+import sys
 import streamlit as st
 import requests
 import pandas as pd
@@ -27,6 +28,21 @@ try:
 except ImportError:
     YFINANCE_AVAILABLE = False
 
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    SCHEDULER_AVAILABLE = True
+except ImportError:
+    SCHEDULER_AVAILABLE = False
+    print("⚠️ apscheduler not installed. Run: pip install apscheduler")
+
+# ──────────────────────────────────────────────
+# TELEGRAM NOTIFICATION SETUP
+# ──────────────────────────────────────────────
+# Set your Telegram bot token and chat ID here
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8777563646:AAGc1wTtz3BcZt--kmkCHwR8unRe0ir7o4Q")  # Set as environment variable or hardcode
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6821479995")      # Set as environment variable or hardcode
+TELEGRAM_ENABLED = TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+
 # ──────────────────────────────────────────────
 # TRADE TRACKER DATABASE (SQLite)
 # ──────────────────────────────────────────────
@@ -34,15 +50,55 @@ except ImportError:
 TRADE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockpulse_trades.db")
 
 
+def _migrate_trades_table():
+    """Migrate the trades table schema to add missing columns."""
+    conn = sqlite3.connect(TRADE_DB_PATH)
+    try:
+        # Check if columns exist
+        cursor = conn.execute("PRAGMA table_info(trades)")
+        columns = {row[1] for row in cursor.fetchall()}
+        
+        # Add open_price column if it doesn't exist
+        if "open_price" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN open_price REAL")
+            conn.commit()
+            print("✅ Migration: Added open_price column to trades table")
+        
+        # Add action column if it doesn't exist
+        if "action" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN action TEXT DEFAULT 'OPEN'")
+            conn.commit()
+            print("✅ Migration: Added action column to trades table")
+            
+    except sqlite3.OperationalError as e:
+        print(f"Migration info: {e}")
+    finally:
+        conn.close()
+
+
 def _get_trade_db():
     """Get a connection to the trades database, creating tables if needed."""
     conn = sqlite3.connect(TRADE_DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("""CREATE TABLE IF NOT EXISTS auto_scan_rank1 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        UNIQUE(scan_date, ticker)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS intraday_tickers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'base',
+        UNIQUE(scan_date, ticker)
+    )""")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ticker TEXT NOT NULL,
             direction TEXT NOT NULL,
+            open_price REAL,
             entry_price REAL NOT NULL,
             stop_loss REAL,
             target1 REAL,
@@ -64,6 +120,7 @@ def _get_trade_db():
             stop_hit INTEGER DEFAULT 0,
             high_since_entry REAL,
             low_since_entry REAL,
+            action TEXT DEFAULT 'OPEN',
             notes TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         )
@@ -132,22 +189,471 @@ def delete_holding(holding_id):
         conn.close()
 
 
+def send_telegram_notification(ticker, direction, open_price, entry_price, stop_loss, target1, target2):
+    """
+    Send a trade entry notification via Telegram.
+    """
+    if not TELEGRAM_ENABLED:
+        print(f"⚠️ Telegram disabled - BOT_TOKEN: {bool(TELEGRAM_BOT_TOKEN)}, CHAT_ID: {bool(TELEGRAM_CHAT_ID)}")
+        return False
+    
+    try:
+        # Format prices safely
+        open_str = f"${open_price:.2f}" if open_price is not None else "N/A"
+        entry_str = f"${entry_price:.2f}"
+        stop_str = f"${stop_loss:.2f}" if stop_loss is not None else "N/A"
+        t1_str = f"${target1:.2f}" if target1 is not None else "N/A"
+        t2_str = f"${target2:.2f}" if target2 is not None else "N/A"
+
+        # Compute RR
+        def _tg_rr(e, s, t, d):
+            try:
+                risk = (e - s) if d == "LONG" else (s - e)
+                rew  = (t - e) if d == "LONG" else (e - t)
+                return round(rew / risk, 2) if risk > 0 else 0.0
+            except: return 0.0
+        rr_t1 = _tg_rr(entry_price, stop_loss, target1, direction) if stop_loss and target1 else 0.0
+        rr_t2 = _tg_rr(entry_price, stop_loss, target2, direction) if stop_loss and target2 else 0.0
+        best_rr = max(rr_t1, rr_t2)
+        date_str = datetime.now(pytz.timezone('US/Central')).strftime('%m/%d/%Y %I:%M %p CST')
+
+        message = f"""
+🔔 <b>NEW TRADE ENTRY</b>
+
+📅 <b>Date:</b> {date_str}
+📊 <b>Ticker:</b> {ticker}
+🎯 <b>Direction:</b> {direction}
+💰 <b>Open:</b> {open_str}
+📍 <b>Entry:</b> {entry_str}
+🛑 <b>Stop:</b> {stop_str}
+🎁 <b>T1:</b> {t1_str}  (RR: {rr_t1:.2f}x)
+🎁 <b>T2:</b> {t2_str}  (RR: {rr_t2:.2f}x)
+⭐ <b>Best RR:</b> {best_rr:.2f}x
+
+📝 <b>Notes:</b> Intraday-Respect Stop Loss and Take Profits
+"""
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, json=payload, timeout=5)
+        success = response.status_code == 200
+        print(f"📱 Telegram send status: {response.status_code} - {response.text[:100] if not success else 'OK'}")
+        return success
+    except Exception as e:
+        print(f"❌ Telegram notification error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def send_trade_update_notification(trade, action, exit_price=None):
+    """
+    Send a trade update notification via Telegram when action changes.
+    """
+    if not TELEGRAM_ENABLED:
+        print(f"⚠️ Telegram disabled - BOT_TOKEN: {bool(TELEGRAM_BOT_TOKEN)}, CHAT_ID: {bool(TELEGRAM_CHAT_ID)}")
+        return False
+    
+    try:
+        ticker = trade.get("ticker", "?")
+        direction = trade.get("direction", "?")
+        entry = trade.get("entry_price", 0)
+        stop = trade.get("stop_loss")
+        t1 = trade.get("target1")
+        t2 = trade.get("target2")
+        
+        print(f"📱 Sending trade update: {ticker} {action} (Entry: ${entry:.2f})")
+        
+        # Calculate P&L if exit price provided
+        pnl_str = ""
+        if exit_price:
+            if direction == "LONG":
+                pnl = round((exit_price - entry) / entry * 100, 2)
+            else:
+                pnl = round((entry - exit_price) / entry * 100, 2)
+            pnl_str = f"\n💹 <b>P&L:</b> {pnl:+.2f}%"
+
+        # Compute RR
+        def _tg_upd_rr(e, s, t, d):
+            try:
+                risk = (e - s) if d == "LONG" else (s - e)
+                rew  = (t - e) if d == "LONG" else (e - t)
+                return round(rew / risk, 2) if risk > 0 else 0.0
+            except: return 0.0
+        rr_t1 = _tg_upd_rr(entry, stop, t1, direction) if stop and t1 else 0.0
+        rr_t2 = _tg_upd_rr(entry, stop, t2, direction) if stop and t2 else 0.0
+        best_rr = max(rr_t1, rr_t2)
+        date_str = datetime.now(pytz.timezone('US/Central')).strftime('%m/%d/%Y %I:%M %p CST')
+
+        action_emoji = {
+            "OPEN": "🟢",
+            "CLOSE": "✅",
+            "TAKE_PROFIT_T1": "🎁",
+            "TAKE_PROFIT_T2": "🎁🎁",
+            "STOP_LOSS": "🛑",
+            "DELETE": "🗑️"
+        }.get(action, "📊")
+        
+        message = f"""
+{action_emoji} <b>TRADE UPDATE</b>
+
+📅 <b>Date:</b> {date_str}
+📊 <b>Ticker:</b> {ticker}
+🎯 <b>Direction:</b> {direction}
+<b>Status:</b> {action.replace("_", " ")}
+
+📍 <b>Entry:</b> ${entry:.2f}
+🛑 <b>Stop:</b> ${"N/A" if not stop else f"{stop:.2f}"}
+🎁 <b>T1:</b> ${"N/A" if not t1 else f"{t1:.2f}"}  (RR: {rr_t1:.2f}x)
+🎁 <b>T2:</b> ${"N/A" if not t2 else f"{t2:.2f}"}  (RR: {rr_t2:.2f}x)
+⭐ <b>Best RR:</b> {best_rr:.2f}x
+
+📝 <b>Notes:</b> Intraday-Respect Stop Loss and Take Profits
+"""
+        
+        if exit_price:
+            message += f"\n💰 <b>Exit Price:</b> ${exit_price:.2f}{pnl_str}"
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        print(f"API URL: {url[:50]}...")
+        print(f"Chat ID: {TELEGRAM_CHAT_ID}")
+        
+        response = requests.post(url, json=payload, timeout=5)
+        success = response.status_code == 200
+        
+        print(f"📊 Response status: {response.status_code}")
+        if not success:
+            print(f"Response body: {response.text[:200]}")
+        
+        return success
+    except Exception as e:
+        print(f"❌ Trade update notification error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def get_market_risk_data():
+    """
+    Fetch real market data and calculate risk assessment.
+    Returns: (risk_label, risk_notes_list)
+    """
+    try:
+        import yfinance as yf
+        
+        # Fetch current data
+        vix_data = yf.Ticker("^VIX").history(period="1d")
+        spy_data = yf.Ticker("SPY").history(period="5d")
+        tlt_data = yf.Ticker("TLT").history(period="5d")
+        gld_data = yf.Ticker("GLD").history(period="5d")
+        
+        risk_score = 0
+        risk_notes = []
+        
+        # VIX Analysis
+        if not vix_data.empty:
+            vix_price = float(vix_data["Close"].iloc[-1])
+            if vix_price > 25:
+                risk_score += 2
+                risk_notes.append(f"VIX {vix_price:.0f} — elevated fear")
+            elif vix_price > 18:
+                risk_score += 1
+                risk_notes.append(f"VIX {vix_price:.0f} — mild caution")
+            else:
+                risk_notes.append(f"VIX {vix_price:.0f} — calm market")
+        
+        # SPY 5-day performance
+        if not spy_data.empty and len(spy_data) >= 2:
+            spy_chg = ((spy_data["Close"].iloc[-1] - spy_data["Close"].iloc[0]) / spy_data["Close"].iloc[0]) * 100
+            if spy_chg < -2:
+                risk_score += 1
+                risk_notes.append(f"SPY 5d: {spy_chg:+.1f}% — market pressure")
+        
+        # TLT (Bond) analysis
+        if not tlt_data.empty and len(tlt_data) >= 2:
+            tlt_chg = ((tlt_data["Close"].iloc[-1] - tlt_data["Close"].iloc[0]) / tlt_data["Close"].iloc[0]) * 100
+            if tlt_chg > 1:
+                risk_score += 1
+                risk_notes.append("Bonds rallying — safe haven demand")
+        
+        # GLD (Gold) analysis
+        if not gld_data.empty and len(gld_data) >= 2:
+            gld_chg = ((gld_data["Close"].iloc[-1] - gld_data["Close"].iloc[0]) / gld_data["Close"].iloc[0]) * 100
+            if gld_chg > 2:
+                risk_score += 1
+                risk_notes.append(f"Gold 5d: {gld_chg:+.1f}% — hedge demand")
+        
+        # Determine risk level
+        if risk_score == 0:
+            risk_label = "🟢 LOW RISK"
+        elif risk_score <= 2:
+            risk_label = "🟡 MODERATE RISK"
+        else:
+            risk_label = "🔴 HIGH RISK"
+        
+        return risk_label, risk_notes
+    
+    except Exception as e:
+        print(f"❌ Market risk data error: {e}")
+        return "🟡 MODERATE RISK", ["Unable to fetch live data"]
+
+
+def send_market_risk_message(risk_label=None, risk_notes=None):
+    """
+    Send Market Risk status message at 8:00 AM CST.
+    If risk_label/notes not provided, fetch real data.
+    """
+    if not TELEGRAM_ENABLED:
+        return False
+    
+    try:
+        # Fetch real data if not provided
+        if risk_label is None or risk_notes is None:
+            risk_label, risk_notes = get_market_risk_data()
+        
+        risk_details = " · ".join(risk_notes) if risk_notes else "No additional risk factors"
+        
+        message = f"""
+📊 <b>MARKET RISK ASSESSMENT</b>
+
+{risk_label}
+
+{risk_details}
+
+🕐 Time: {datetime.now(pytz.timezone('US/Central')).strftime('%I:%M %p CST')}
+"""
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, json=payload, timeout=5)
+        success = response.status_code == 200
+        print(f"📊 Market Risk message sent: {'✅' if success else '❌'}")
+        return success
+    except Exception as e:
+        print(f"❌ Market Risk message error: {e}")
+        return False
+
+
+def send_tracking_initiated_message():
+    """
+    Send tracking initiated message at 8:30 AM CST.
+    """
+    if not TELEGRAM_ENABLED:
+        return False
+    
+    try:
+        cst_tz = pytz.timezone('US/Central')
+        now_cst = datetime.now(cst_tz)
+        
+        message = f"""
+🤖 <b>BOT STATUS - TRACKING INITIATED</b>
+
+✅ Bot is running and monitoring market
+
+📅 Date: {now_cst.strftime('%B %d, %Y')}
+🕐 Time: {now_cst.strftime('%I:%M %p CST')}
+
+Looking for:
+  • Open prices
+  • Entry opportunities
+  • Market signals
+
+Ready to track trades!
+"""
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        response = requests.post(url, json=payload, timeout=5)
+        success = response.status_code == 200
+        print(f"🤖 Tracking initiated message sent: {'✅' if success else '❌'}")
+        return success
+    except Exception as e:
+        print(f"❌ Tracking initiated message error: {e}")
+        return False
+
+
+def send_sector_swing_alert(swing_trades):
+    """Send Telegram alert with sector scan swing trade setups (EOD push)."""
+    if not TELEGRAM_ENABLED or not swing_trades:
+        return False
+    try:
+        cst_tz = pytz.timezone('US/Central')
+        now_cst = datetime.now(cst_tz)
+
+        bullish = [t for t in swing_trades if t.get("verdict") == "BULLISH"]
+        bearish = [t for t in swing_trades if t.get("verdict") == "BEARISH"]
+
+        lines = [
+            "🔥 <b>SECTOR SCAN — SWING SETUPS</b>",
+            "",
+            f"📅 {now_cst.strftime('%B %d, %Y')} · {len(swing_trades)} setup(s) pushed to Trade Tracker",
+        ]
+
+        if bullish:
+            lines.append(f"\n🚀 <b>LONG SETUPS ({len(bullish)})</b>")
+            for r in bullish:
+                entry  = r.get("entry") or r.get("price") or 0
+                stop   = r.get("stop_loss") or 0
+                t1     = r.get("target1") or 0
+                t2     = r.get("target2") or 0
+                score  = r.get("score", 0)
+                conf   = r.get("confidence", "")
+                risk_pct   = abs((entry - stop) / entry * 100) if entry and stop else 0
+                reward_pct = abs((t1 - entry) / entry * 100) if t1 and entry else 0
+                rr = f"{reward_pct / risk_pct:.1f}x" if risk_pct > 0 else "N/A"
+                lines.append(
+                    f"\n  • <b>{r['ticker']}</b>  Score: +{score} · {conf}\n"
+                    f"    Entry: ${entry:.2f} · Stop: ${stop:.2f} · T1: ${t1:.2f}"
+                    + (f" · T2: ${t2:.2f}" if t2 else "")
+                    + f"\n    Risk: {risk_pct:.1f}%  R:R ~{rr}"
+                )
+
+        if bearish:
+            lines.append(f"\n📉 <b>SHORT SETUPS ({len(bearish)})</b>")
+            for r in bearish:
+                entry  = r.get("entry") or r.get("price") or 0
+                stop   = r.get("stop_loss") or 0
+                t1     = r.get("target1") or 0
+                t2     = r.get("target2") or 0
+                score  = r.get("score", 0)
+                conf   = r.get("confidence", "")
+                risk_pct   = abs((stop - entry) / entry * 100) if entry and stop else 0
+                reward_pct = abs((entry - t1) / entry * 100) if t1 and entry else 0
+                rr = f"{reward_pct / risk_pct:.1f}x" if risk_pct > 0 else "N/A"
+                lines.append(
+                    f"\n  • <b>{r['ticker']}</b>  Score: {score} · {conf}\n"
+                    f"    Entry: ${entry:.2f} · Stop: ${stop:.2f} · T1: ${t1:.2f}"
+                    + (f" · T2: ${t2:.2f}" if t2 else "")
+                    + f"\n    Risk: {risk_pct:.1f}%  R:R ~{rr}"
+                )
+
+        lines.append("\n✅ Saved to Trade Tracker")
+
+        message = "\n".join(lines)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        response = requests.post(url, json=payload, timeout=10)
+        success = response.status_code == 200
+        print(f"🔥 Sector swing alert sent: {'✅' if success else '❌'}")
+        return success
+    except Exception as e:
+        print(f"❌ Sector swing alert error: {e}")
+        return False
+
+
+def send_swing_morning_brief():
+    """8:35 AM Telegram brief — open swing trades status vs entry plan."""
+    if not TELEGRAM_ENABLED:
+        return False
+    try:
+        import yfinance as yf
+        cst_tz = pytz.timezone('US/Central')
+        now_cst = datetime.now(cst_tz)
+
+        all_trades = get_all_trades()
+        open_trades = [t for t in all_trades if t.get("status") == "OPEN"]
+
+        if not open_trades:
+            return False
+
+        lines = [
+            "🌅 <b>SWING TRADE MORNING BRIEF</b>",
+            "",
+            f"📅 {now_cst.strftime('%B %d, %Y')} · {now_cst.strftime('%I:%M %p CST')}",
+            f"Open trades: <b>{len(open_trades)}</b>",
+        ]
+
+        for t in open_trades:
+            ticker    = t["ticker"]
+            direction = t["direction"]
+            entry     = t.get("entry_price", 0)
+            stop      = t.get("stop_loss")
+            t1        = t.get("target1")
+
+            try:
+                hist    = yf.Ticker(ticker).history(period="1d")
+                current = float(hist["Close"].iloc[-1]) if not hist.empty else None
+            except Exception:
+                current = None
+
+            if current and entry:
+                pnl_pct = ((current - entry) / entry * 100) if direction == "LONG" \
+                          else ((entry - current) / entry * 100)
+                icon = "🟢" if pnl_pct > 0 else "🔴"
+                at_risk  = stop and (
+                    (direction == "LONG"  and current <= stop * 1.01) or
+                    (direction == "SHORT" and current >= stop * 0.99)
+                )
+                near_t1  = t1 and (
+                    (direction == "LONG"  and current >= t1 * 0.98) or
+                    (direction == "SHORT" and current <= t1 * 1.02)
+                )
+                flag = " ⚠️ NEAR STOP" if at_risk else (" 🎯 NEAR T1" if near_t1 else "")
+                stop_str = f" · Stop: ${stop:.2f}" if stop else ""
+                t1_str   = f" · T1: ${t1:.2f}" if t1 else ""
+                lines.append(
+                    f"\n{icon} <b>{ticker}</b> {direction}\n"
+                    f"  Entry: ${entry:.2f} → Now: ${current:.2f} ({pnl_pct:+.1f}%){flag}\n"
+                    f"  {stop_str}{t1_str}".strip()
+                )
+            else:
+                lines.append(f"\n⬜ <b>{ticker}</b> {direction} · Entry: ${entry:.2f} (price N/A)")
+
+        message = "\n".join(lines)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        response = requests.post(url, json=payload, timeout=10)
+        success = response.status_code == 200
+        print(f"🌅 Swing morning brief sent: {'✅' if success else '❌'}")
+        return success
+    except Exception as e:
+        print(f"❌ Swing morning brief error: {e}")
+        return False
+
+
 def save_trade(ticker, direction, entry_price, stop_loss=None, target1=None,
                target2=None, verdict=None, confidence=None, score=None,
-               signals=None, t1_days=None, t2_days=None, notes=None):
-    """Save a new trade to the database."""
+               signals=None, t1_days=None, t2_days=None, open_price=None, notes=None):
+    """Save a new trade to the database and send Telegram notification.
+    Returns tuple: (success, telegram_sent)
+    """
     conn = _get_trade_db()
     try:
         conn.execute("""
-            INSERT INTO trades (ticker, direction, entry_price, stop_loss, target1,
+            INSERT INTO trades (ticker, direction, open_price, entry_price, stop_loss, target1,
                 target2, verdict, confidence, score, signals, t1_trading_days,
                 t2_trading_days, entry_date, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (ticker, direction, entry_price, stop_loss, target1, target2,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticker, direction, open_price, entry_price, stop_loss, target1, target2,
               verdict, confidence, score, signals, t1_days, t2_days,
               str(date.today()), notes))
         conn.commit()
-        return True
+        
+        # Send Telegram notification
+        telegram_sent = send_telegram_notification(ticker, direction, open_price, entry_price, stop_loss, target1, target2)
+        
+        return True, telegram_sent
     finally:
         conn.close()
 
@@ -194,7 +700,7 @@ def update_trade(trade_id, **kwargs):
     try:
         valid = {"status", "exit_price", "exit_date", "pnl_pct", "outcome",
                  "t1_hit", "t2_hit", "stop_hit", "high_since_entry",
-                 "low_since_entry", "notes"}
+                 "low_since_entry", "action", "notes"}
         updates = {k: v for k, v in kwargs.items() if k in valid}
         if not updates:
             return
@@ -315,52 +821,156 @@ def is_after_market_time(hour_cst, minute_cst=0):
     return now_cst >= market_time
 
 
-def get_multiframe_bias_eval(ticker, entry_price, direction):
+def get_multiframe_bias_eval(ticker, entry_price, direction, target_date=None):
     """
-    Evaluate bias using adaptive timeframes:
-      - Market hours (weekday 8:30-15:00 CST): 10-min / 30-min
-      - After hours (weekday 15:00+):           4-hour / 1-day
-      - Weekends (Sat/Sun):                     1-day  / 5-day (last Friday data)
+    Evaluate bias using two timeframes:
+      - Short: 10-min bars from 8:20 AM CST today (present bias)
+      - Long:  4H candle bias from prior sessions (past bias / trend anchor)
+      - After hours / weekends: falls back to daily data
+    Open reference: 8:30 AM CST (9:30 AM ET) regular market open.
     Returns dict with bias info, alignment, conclusion, current_price.
+
+    If target_date (datetime.date or datetime) is provided, evaluate bias
+    as of that historical date instead of today.  Simulates "market hours"
+    for the target date so intraday logic always runs.
     """
     try:
         import yfinance as yf
 
-        now_cst = get_cst_now()
+        cst_tz = pytz.timezone("America/Chicago")
+        et_tz = pytz.timezone("America/New_York")
+
+        is_backtest = target_date is not None
+        if is_backtest:
+            if isinstance(target_date, datetime):
+                ref_date = target_date.date() if not hasattr(target_date, 'date') or callable(target_date.date) else target_date
+                ref_date = target_date.date()
+            else:
+                ref_date = target_date  # already a date object
+            # For backtest, always simulate market hours
+            now_cst = cst_tz.localize(datetime(ref_date.year, ref_date.month, ref_date.day, 12, 0, 0))
+        else:
+            now_cst = get_cst_now()
+
         weekday = now_cst.weekday()  # 0=Mon .. 6=Sun
         hour = now_cst.hour
+        minute = now_cst.minute
 
-        # Determine which timeframe pair to use
         is_weekend = weekday >= 5
-        is_market_hours = (not is_weekend) and (8 <= hour < 15)
-
-        if is_weekend:
-            # Weekend: 1-day / 5-day (covers last Friday)
-            tf_short_interval, tf_short_period = "1d", "5d"
-            tf_long_interval,  tf_long_period  = "1d", "1mo"
-            tf_short_label, tf_long_label = "1D", "5D"
-            short_bars, long_bars = 1, 5
-        elif is_market_hours:
-            # Market hours: 10-min / 30-min
-            tf_short_interval, tf_short_period = "10m", "5d"
-            tf_long_interval,  tf_long_period  = "30m", "5d"
-            tf_short_label, tf_long_label = "10m", "30m"
-            short_bars, long_bars = 3, 3
-        else:
-            # After hours weekday: 4-hour / 1-day
-            tf_short_interval, tf_short_period = "1h", "5d"
-            tf_long_interval,  tf_long_period  = "1d", "1mo"
-            tf_short_label, tf_long_label = "4H", "1D"
-            short_bars, long_bars = 4, 1
+        is_market_hours = is_backtest or ((not is_weekend) and ((hour > 8 or (hour == 8 and minute >= 20)) and hour < 15))
 
         tk = yf.Ticker(ticker)
-        hist_short = tk.history(period=tf_short_period, interval=tf_short_interval)
-        hist_long  = tk.history(period=tf_long_period,  interval=tf_long_interval)
 
-        if hist_short.empty or hist_long.empty:
-            return None
+        if is_weekend and not is_backtest:
+            tf_short_label, tf_long_label = "1D", "5D"
+            hist_short = tk.history(period="5d", interval="1d")
+            hist_long  = tk.history(period="1mo", interval="1d")
+            if hist_short.empty or hist_long.empty:
+                return None
+            short_bars = 1
+            long_bars = 5
+            current_price = float(hist_short["Close"].iloc[-1])
+        elif is_market_hours:
+            tf_short_label, tf_long_label = "10m", "4H"
 
-        current_price = float(hist_short["Close"].iloc[-1])
+            # ── Determine date range for yfinance ──
+            if is_backtest:
+                fetch_start = ref_date - timedelta(days=7)
+                fetch_end   = ref_date + timedelta(days=1)
+                hist_5m = tk.history(start=str(fetch_start), end=str(fetch_end), interval="5m", prepost=True)
+            else:
+                hist_5m = tk.history(period="5d", interval="5m", prepost=True)
+            # Resample 5m -> 10m
+            if not hist_5m.empty:
+                hist_5m.index = pd.to_datetime(hist_5m.index)
+                hist_10m = hist_5m.resample("10min").agg({
+                    "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+                }).dropna()
+            else:
+                hist_10m = hist_5m
+            if hist_10m.empty:
+                return None
+
+            today_820_cst = cst_tz.localize(datetime(now_cst.year, now_cst.month, now_cst.day, 8, 20, 0))
+            today_820_et = today_820_cst.astimezone(et_tz)
+
+            # For backtest: end-of-day cutoff so we get the full session
+            if is_backtest:
+                today_eod_cst = cst_tz.localize(datetime(now_cst.year, now_cst.month, now_cst.day, 15, 0, 0))
+                today_eod_et = today_eod_cst.astimezone(et_tz)
+
+            idx = hist_10m.index
+            if idx.tz is None:
+                idx = idx.tz_localize("America/New_York")
+            else:
+                idx = idx.tz_convert("America/New_York")
+
+            if is_backtest:
+                hist_short = hist_10m[(idx >= today_820_et) & (idx <= today_eod_et)]
+            else:
+                hist_short = hist_10m[idx >= today_820_et]
+
+            if hist_short.empty:
+                return None
+
+            short_bars = len(hist_short)
+            # Use 8:30 AM CST open as bias reference
+            today_open = float(hist_short["Open"].iloc[0])
+            entry_price = today_open
+            current_price = float(hist_short["Close"].iloc[-1])
+
+            # ── Long: past 4H candle bias (from hourly bars) ──
+            if is_backtest:
+                hist_1h = tk.history(start=str(fetch_start), end=str(fetch_end), interval="1h", prepost=True)
+            else:
+                hist_1h = tk.history(period="5d", interval="1h", prepost=True)
+            if hist_1h.empty:
+                return None
+            hdf = hist_1h.copy()
+            hdf.index = pd.to_datetime(hdf.index)
+            bars_4h = hdf.resample("4h").agg({
+                "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+            }).dropna()
+
+            # Exclude current session bars — only use *past* 4H candles
+            today_start_et = today_820_et
+            b4h_idx = bars_4h.index
+            if b4h_idx.tz is None:
+                b4h_idx = b4h_idx.tz_localize("America/New_York")
+            else:
+                b4h_idx = b4h_idx.tz_convert("America/New_York")
+            hist_long = bars_4h[b4h_idx < today_start_et]
+
+            if hist_long.empty or len(hist_long) < 2:
+                # Not enough past 4H data — use daily as fallback
+                if is_backtest:
+                    hist_long = tk.history(start=str(ref_date - timedelta(days=30)), end=str(ref_date), interval="1d")
+                else:
+                    hist_long = tk.history(period="1mo", interval="1d")
+                if hist_long.empty:
+                    return None
+                long_bars = 3
+                tf_long_label = "Daily"
+            else:
+                long_bars = min(len(hist_long), 3)  # Last 3 completed 4H candles
+        else:
+            # After hours weekday
+            tf_short_label, tf_long_label = "4H", "1D"
+            hist_short = tk.history(period="5d", interval="1h")
+            hist_long  = tk.history(period="1mo", interval="1d")
+            if hist_short.empty or hist_long.empty:
+                return None
+            # Resample to 4H
+            hdf = hist_short.copy()
+            hdf.index = pd.to_datetime(hdf.index)
+            hist_short = hdf.resample("4h").agg({
+                "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+            }).dropna()
+            if hist_short.empty:
+                return None
+            short_bars = min(len(hist_short), 3)
+            long_bars = 3
+            current_price = float(hist_short["Close"].iloc[-1])
 
         def eval_simple_bias(df, entry, n_bars):
             """Bias: are recent n closes above/below entry?"""
@@ -390,9 +1000,9 @@ def get_multiframe_bias_eval(ticker, entry_price, direction):
             color = "#f5c842"
 
         return {
-            "bias_10min": bias_short,         # kept key name for compat
+            "bias_10min": bias_short,
             "vol_bias_10min": round(vol_bias_short, 4),
-            "bias_30min": bias_long,
+            "bias_30min": bias_long,           # key kept for compat — now holds 4H bias
             "vol_bias_30min": round(vol_bias_long, 4),
             "tf_short": tf_short_label,
             "tf_long": tf_long_label,
@@ -402,6 +1012,145 @@ def get_multiframe_bias_eval(ticker, entry_price, direction):
             "current_price": round(current_price, 2)
         }
     except Exception as e:
+        return None
+
+
+def get_830_bias_eval(ticker, direction, target_date=None):
+    """
+    8:30 AM CST entry confirmation bias.
+    Returns 10m, 30m, and 4H biases — all anchored to the target day's 8:30 AM CST open.
+    Live: only works during market hours. Returns None otherwise.
+    Backtest: pass target_date (date or datetime) to evaluate a historical session.
+    """
+    try:
+        import yfinance as yf
+
+        cst_tz = pytz.timezone("America/Chicago")
+        et_tz = pytz.timezone("America/New_York")
+
+        is_backtest = target_date is not None
+        if is_backtest:
+            ref_date = target_date.date() if isinstance(target_date, datetime) else target_date
+            now_cst = cst_tz.localize(datetime(ref_date.year, ref_date.month, ref_date.day, 12, 0, 0))
+        else:
+            now_cst = get_cst_now()
+
+        weekday = now_cst.weekday()
+        hour = now_cst.hour
+        minute = now_cst.minute
+
+        is_weekend = weekday >= 5
+        # Skip weekend / pre-8:30 for live mode only
+        if not is_backtest and (is_weekend or (hour < 8 or (hour == 8 and minute < 30))):
+            return None
+
+        tk = yf.Ticker(ticker)
+
+        # Date anchors
+        today_830_cst = cst_tz.localize(datetime(now_cst.year, now_cst.month, now_cst.day, 8, 30, 0))
+        today_830_et = today_830_cst.astimezone(et_tz)
+        today_820_cst = cst_tz.localize(datetime(now_cst.year, now_cst.month, now_cst.day, 8, 20, 0))
+        today_820_et = today_820_cst.astimezone(et_tz)
+
+        # For backtest: cap at end of regular session
+        if is_backtest:
+            today_eod_cst = cst_tz.localize(datetime(now_cst.year, now_cst.month, now_cst.day, 15, 0, 0))
+            today_eod_et = today_eod_cst.astimezone(et_tz)
+            fetch_start = ref_date - timedelta(days=7)
+            fetch_end   = ref_date + timedelta(days=1)
+
+        def _filter_from(df, cutoff_et):
+            idx = df.index
+            if idx.tz is None:
+                idx = idx.tz_localize("America/New_York")
+            else:
+                idx = idx.tz_convert("America/New_York")
+            if is_backtest:
+                return df[(idx >= cutoff_et) & (idx <= today_eod_et)]
+            return df[idx >= cutoff_et]
+
+        # ── 10m bars ──
+        if is_backtest:
+            hist_5m_raw = tk.history(start=str(fetch_start), end=str(fetch_end), interval="5m", prepost=True)
+        else:
+            hist_5m_raw = tk.history(period="5d", interval="5m", prepost=True)
+        # Resample 5m -> 10m
+        if not hist_5m_raw.empty:
+            hist_5m_raw.index = pd.to_datetime(hist_5m_raw.index)
+            hist_10m_raw = hist_5m_raw.resample("10min").agg({
+                "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+            }).dropna()
+        else:
+            hist_10m_raw = hist_5m_raw
+        if hist_10m_raw.empty:
+            return None
+        hist_10m = _filter_from(hist_10m_raw, today_820_et)
+        if hist_10m.empty:
+            return None
+
+        # Open reference = first bar's Open (8:30 AM CST market open)
+        today_open = float(hist_10m["Open"].iloc[0])
+        current_price = float(hist_10m["Close"].iloc[-1])
+
+        # ── 30m bars ──
+        if is_backtest:
+            hist_30m_raw = tk.history(start=str(fetch_start), end=str(fetch_end), interval="30m", prepost=True)
+        else:
+            hist_30m_raw = tk.history(period="5d", interval="30m", prepost=True)
+        hist_30m = _filter_from(hist_30m_raw, today_820_et) if not hist_30m_raw.empty else pd.DataFrame()
+
+        # ── 4H: past completed 4H candles (prior sessions only) ──
+        if is_backtest:
+            hist_1h = tk.history(start=str(fetch_start), end=str(fetch_end), interval="1h", prepost=True)
+        else:
+            hist_1h = tk.history(period="5d", interval="1h", prepost=True)
+        hist_4h = pd.DataFrame()
+        if not hist_1h.empty:
+            hdf = hist_1h.copy()
+            hdf.index = pd.to_datetime(hdf.index)
+            bars_4h = hdf.resample("4h").agg({
+                "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+            }).dropna()
+            b4h_idx = bars_4h.index
+            if b4h_idx.tz is None:
+                b4h_idx = b4h_idx.tz_localize("America/New_York")
+            else:
+                b4h_idx = b4h_idx.tz_convert("America/New_York")
+            hist_4h = bars_4h[b4h_idx < today_820_et]
+
+        def _eval_bias(df, ref_price, n_bars):
+            """BULLISH if avg close > ref, else BEARISH (relative to direction)."""
+            if df.empty or len(df) < 1:
+                return "N/A"
+            closes = df["Close"].tail(n_bars).values
+            avg_close = float(np.mean(closes))
+            if direction == "LONG":
+                return "BULLISH" if avg_close > ref_price else "BEARISH"
+            else:
+                return "BEARISH" if avg_close < ref_price else "BULLISH"
+
+        bias_10m = _eval_bias(hist_10m, today_open, len(hist_10m))
+        bias_30m = _eval_bias(hist_30m, today_open, len(hist_30m)) if not hist_30m.empty else "N/A"
+        bias_4h  = _eval_bias(hist_4h, today_open, min(len(hist_4h), 3)) if not hist_4h.empty else "N/A"
+
+        # Alignment: all 3 agree = CONFIRMED, else DIVERGED
+        valid_biases = [b for b in [bias_10m, bias_30m, bias_4h] if b != "N/A"]
+        if len(valid_biases) >= 2 and len(set(valid_biases)) == 1:
+            alignment = "CONFIRMED"
+        elif len(valid_biases) >= 2:
+            alignment = "DIVERGED"
+        else:
+            alignment = "N/A"
+
+        return {
+            "bias_10m": bias_10m,
+            "bias_30m": bias_30m,
+            "bias_4h":  bias_4h,
+            "alignment": alignment,
+            "today_open": round(today_open, 2),
+            "current_price": round(current_price, 2),
+        }
+    except Exception:
         return None
 
 
@@ -611,7 +1360,6 @@ def get_hourly_bars_yfinance(ticker, start_date, end_date):
             return pd.DataFrame()
         # Ensure timezone is ET
         if df.index.tz is None:
-            from zoneinfo import ZoneInfo
             df.index = df.index.tz_localize("America/New_York")
         else:
             df.index = df.index.tz_convert("America/New_York")
@@ -2773,11 +3521,7 @@ SCAN_WATCHLIST = [
 # Criteria for exclusion: WR < break-even (avg_loss / (avg_win + avg_loss))
 #   after applying score ≥ 4 + HIGH conf + no-short + adaptive ATR filters.
 # To re-enable a ticker: backtest it first on ≥ 30 trades and confirm WR > 55%.
-EXCLUDED_INSTRUMENTS = {
-    "IWM",   # Mean-reverting small-cap ETF. Backtest: 44.4% WR even at score 4+/HIGH.
-             # Now also caught automatically by _classify_instrument persistence check,
-             # but kept here as an explicit hard block with a clear reason string.
-}
+EXCLUDED_INSTRUMENTS = set()  # No hard exclusions — mean-rev instruments get SKIP status instead
 
 
 def _is_instrument_supported(ticker: str, daily_df) -> tuple:
@@ -2794,13 +3538,15 @@ def _is_instrument_supported(ticker: str, daily_df) -> tuple:
                        f"trend signals not reliable on this instrument")
 
     # 2. Data-driven classification — detects mean-reverting behaviour dynamically
+    #    NOTE: mean-rev instruments still supported — they get SKIP status with
+    #    entry levels so users can see them in the scanner.
     if daily_df is not None and not daily_df.empty and len(daily_df) >= 40:
         profile = _classify_instrument(t, daily_df)
         if profile["is_mean_rev"]:
             pct   = profile["atr_pct"] * 100
             pers  = profile["persistence"] * 100
             qt    = profile["quote_type"]
-            return False, (
+            return True, (
                 f"{t} classified as mean-reverting "
                 f"(ATR%={pct:.1f}%, persistence={pers:.0f}%, type={qt}). "
                 f"Trend-following signals unreliable — backtest before trading."
@@ -3070,8 +3816,22 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
             daily_df = get_daily_bars_alpaca(ticker, str(start_date), str(end_date), api_key, api_secret)
         else:
             daily_df = get_daily_bars(ticker, str(start_date), str(end_date), api_key)
-        
-        if daily_df.empty or len(daily_df) < 20:
+
+        # Fallback to yfinance if primary source returned no data
+        if (daily_df is None or daily_df.empty or len(daily_df) < 20) and YFINANCE_AVAILABLE:
+            try:
+                import yfinance as yf
+                _yf = yf.Ticker(ticker)
+                _yf_hist = _yf.history(period="1y", auto_adjust=True)
+                if _yf_hist is not None and not _yf_hist.empty and len(_yf_hist) >= 20:
+                    daily_df = _yf_hist.rename(columns={
+                        "Open": "open", "High": "high", "Low": "low",
+                        "Close": "close", "Volume": "volume"
+                    })[["open", "high", "low", "close", "volume"]]
+            except Exception:
+                pass
+
+        if daily_df is None or daily_df.empty or len(daily_df) < 20:
             return None
 
         # ── Instrument suitability gate ──
@@ -3245,7 +4005,19 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
             entry     = round(current_price, 2)
             stop_loss = None; target1 = None; target2 = None
             risk_pct  = None; t1_days = None; t2_days = None
-        
+
+        # ── Risk/Reward ratios ──
+        def _scan_rr(e, s, t, d):
+            try:
+                risk = (e - s) if d in ("BULLISH", "LEAN BULLISH") else (s - e)
+                rew  = (t - e) if d in ("BULLISH", "LEAN BULLISH") else (e - t)
+                return round(rew / risk, 2) if risk > 0 else 0.0
+            except: return 0.0
+        _dir = verdict
+        rr_t1 = _scan_rr(entry, stop_loss, target1, _dir) if stop_loss and target1 else 0.0
+        rr_t2 = _scan_rr(entry, stop_loss, target2, _dir) if stop_loss and target2 else 0.0
+        best_rr = max(rr_t1, rr_t2)
+
         # Get fundamentals (valuation + growth + profitability + risk)
         fundamentals = get_fundamentals(ticker)
         valuation = fundamentals.get("valuation", "N/A") if fundamentals else "N/A"
@@ -3294,6 +4066,9 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
             "market_cap":       market_cap,
             "target_1y":        target_price_1y,
             "target_upside":    target_upside,
+            "rr_t1":            rr_t1,
+            "rr_t2":            rr_t2,
+            "best_rr":          best_rr,
         }
 
         # ── Multi-timeframe signal & action ──
@@ -3956,6 +4731,55 @@ st.set_page_config(
     layout="wide",
 )
 
+# Run database migrations
+_migrate_trades_table()
+
+# ──────────────────────────────────────────────
+# SCHEDULED TELEGRAM MESSAGES (8:00 AM & 8:30 AM CST)
+# ──────────────────────────────────────────────
+if SCHEDULER_AVAILABLE and TELEGRAM_ENABLED:
+    if "scheduler_initialized" not in st.session_state:
+        try:
+            scheduler = BackgroundScheduler()
+            
+            # Schedule at 8:00 AM CST - Market Risk (fetches real data)
+            scheduler.add_job(
+                send_market_risk_message,
+                "cron",
+                hour=8,
+                minute=0,
+                timezone="US/Central",
+                id="market_risk_8am"
+            )
+            
+            # Schedule at 8:30 AM CST - Tracking Initiated
+            scheduler.add_job(
+                send_tracking_initiated_message,
+                "cron",
+                hour=8,
+                minute=30,
+                timezone="US/Central",
+                id="tracking_initiated_830am"
+            )
+
+            # Schedule at 8:35 AM CST - Swing Trade Morning Brief
+            scheduler.add_job(
+                send_swing_morning_brief,
+                "cron",
+                hour=8,
+                minute=35,
+                timezone="US/Central",
+                id="swing_morning_brief_835am"
+            )
+            
+            scheduler.start()
+            st.session_state.scheduler_initialized = True
+            print("✅ Telegram scheduler started - Messages at 8:00 AM, 8:30 AM, and 8:35 AM CST")
+        except Exception as e:
+            print(f"⚠️ Scheduler setup error: {e}")
+elif not SCHEDULER_AVAILABLE:
+    print("⚠️ APScheduler not installed - scheduled messages disabled")
+
 # ──────────────────────────────────────────────
 # INSPIRATIONAL QUOTES (rotates on each load)
 # ──────────────────────────────────────────────
@@ -4161,6 +4985,48 @@ with st.sidebar:
         '</div>',
         unsafe_allow_html=True,
     )
+    
+    # ── Telegram Test Section ──
+    if TELEGRAM_ENABLED:
+        st.markdown("---")
+        st.markdown("### 📱 Telegram Test")
+        
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            if st.button("📊 Test Market Risk", key="test_market_risk", use_container_width=True):
+                with st.spinner("Fetching live market data..."):
+                    send_market_risk_message()  # Fetches real data
+                st.success("✅ Market Risk message sent with live data!")
+        
+        with col_t2:
+            if st.button("🤖 Test Tracking Init", key="test_tracking", use_container_width=True):
+                send_tracking_initiated_message()
+                st.success("✅ Tracking message sent!")
+        
+        st.caption("Messages scheduled for 8:00 AM & 8:30 AM CST daily")
+    
+    # ── Debug Section ──
+    st.markdown("---")
+    st.markdown("### 🔧 Debug Info")
+    
+    if st.checkbox("Show all trades in database", key="show_all_trades_debug"):
+        all_trades_debug = get_all_trades()
+        st.write(f"**Total trades in database:** {len(all_trades_debug)}")
+        
+        if all_trades_debug:
+            # Group by status
+            open_debug = [t for t in all_trades_debug if t["status"] == "OPEN"]
+            closed_debug = [t for t in all_trades_debug if t["status"] == "CLOSED"]
+            
+            st.write(f"**Open trades:** {len(open_debug)}")
+            if open_debug:
+                for t in open_debug:
+                    st.write(f"  • {t['ticker']} {t['direction']} @ ${t['entry_price']:.2f} · Action: {t.get('action', 'N/A')}")
+            
+            st.write(f"**Closed trades:** {len(closed_debug)}")
+            if closed_debug:
+                for t in closed_debug[:5]:  # Show last 5
+                    st.write(f"  • {t['ticker']} {t['direction']} · P&L: {t.get('pnl_pct', 0):+.2f}%")
 
 
 # ── Credential check ─────────────────────────────────
@@ -4192,6 +5058,120 @@ if "fetched_data" not in st.session_state:
 
 # Default shared values
 default_watchlist = "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,AMD,NFLX,CRM,ORCL,ADBE,INTC,PYPL,SQ,SHOP,COIN,UBER,ABNB,SNOW,BA,CAT,GS,JPM,V,MA,DIS,NKE,SBUX,MCD,XOM,CVX,PFE,JNJ,UNH,MRNA,LLY,ABBV,BMY,MRK,SPY,QQQ,IWM,DIA,XLF,XLE,XLK,ARKK,SOXX,SMH"
+
+# ──────────────────────────────────────────────
+# 8 AM CST AUTO-SCAN — Rank 1 tickers → Intraday list (DB-persisted)
+# ──────────────────────────────────────────────
+def _save_rank1_to_db(scan_date, tickers):
+    """Save Rank 1 tickers for a given date to DB. Always writes a marker row so we know scan ran."""
+    conn = _get_trade_db()
+    try:
+        conn.execute("DELETE FROM auto_scan_rank1 WHERE scan_date = ?", (scan_date,))
+        # Always insert a marker row (ticker='__SCAN_DONE__') so we know scan completed
+        conn.execute("INSERT OR IGNORE INTO auto_scan_rank1 (scan_date, ticker) VALUES (?, '__SCAN_DONE__')", (scan_date,))
+        for t in tickers:
+            conn.execute("INSERT OR IGNORE INTO auto_scan_rank1 (scan_date, ticker) VALUES (?, ?)", (scan_date, t))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _load_rank1_from_db(scan_date):
+    """Load Rank 1 tickers for a given date from DB. Returns list of tickers (excludes marker)."""
+    conn = _get_trade_db()
+    try:
+        rows = conn.execute("SELECT ticker FROM auto_scan_rank1 WHERE scan_date = ? AND ticker != '__SCAN_DONE__'", (scan_date,)).fetchall()
+        return [r["ticker"] for r in rows]
+    finally:
+        conn.close()
+
+def _scan_already_done_today(scan_date):
+    """Check if the auto-scan already ran for the given date."""
+    conn = _get_trade_db()
+    try:
+        row = conn.execute("SELECT 1 FROM auto_scan_rank1 WHERE scan_date = ? AND ticker = '__SCAN_DONE__'", (scan_date,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+_BASE_INTRADAY_TICKERS = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOG"]
+
+def _seed_intraday_tickers_for_date(scan_date):
+    """Ensure base tickers exist in intraday_tickers for the given date."""
+    conn = _get_trade_db()
+    try:
+        for t in _BASE_INTRADAY_TICKERS:
+            conn.execute(
+                "INSERT OR IGNORE INTO intraday_tickers (scan_date, ticker, source) VALUES (?, ?, 'base')",
+                (scan_date, t),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _add_scan_tickers_to_intraday(scan_date, tickers):
+    """Append auto-scanned Rank 1 tickers to intraday_tickers (deduped)."""
+    conn = _get_trade_db()
+    try:
+        for t in tickers:
+            conn.execute(
+                "INSERT OR IGNORE INTO intraday_tickers (scan_date, ticker, source) VALUES (?, ?, 'scan')",
+                (scan_date, t),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _load_intraday_tickers(scan_date):
+    """Load all intraday tickers for the date from DB (base first, then scan). Returns list of tickers."""
+    conn = _get_trade_db()
+    try:
+        rows = conn.execute(
+            "SELECT ticker, source FROM intraday_tickers WHERE scan_date = ? ORDER BY source ASC, id ASC",
+            (scan_date,),
+        ).fetchall()
+        return [r["ticker"] for r in rows]
+    finally:
+        conn.close()
+
+_cst_now = datetime.now(pytz.timezone("US/Central"))
+_today_str = _cst_now.strftime("%Y-%m-%d")
+_auto_scan_done_key = f"auto_scan_done_{_today_str}"
+
+# Check if scan already done today (in DB)
+_db_rank1 = _load_rank1_from_db(_today_str)
+_scan_done_in_db = _scan_already_done_today(_today_str)
+if _scan_done_in_db:
+    st.session_state["auto_scan_rank1"] = _db_rank1
+    st.session_state[_auto_scan_done_key] = True
+
+# Seed base intraday tickers for today
+_seed_intraday_tickers_for_date(_today_str)
+# If Rank 1 tickers already in DB, also add them to intraday table
+if _db_rank1:
+    _add_scan_tickers_to_intraday(_today_str, _db_rank1)
+
+if _cst_now.hour >= 8 and not st.session_state.get(_auto_scan_done_key, False):
+    _scan_tickers = [t.strip() for t in default_watchlist.split(",") if t.strip()]
+    _rank1_tickers = []
+    _scan_placeholder = st.empty()
+    _scan_placeholder.info(f"🔬 8 AM Auto-Scan: scanning {len(_scan_tickers)} tickers for Rank 1 — Full Align...")
+    for _st in _scan_tickers:
+        try:
+            _res = scan_single_stock(_st, api_key, api_secret, data_source)
+            if _res and _res.get("mtf_rank") == 1 and _res.get("entry_status") == "ENTER":
+                _rank1_tickers.append(_st)
+        except Exception:
+            pass
+    st.session_state[_auto_scan_done_key] = True
+    st.session_state["auto_scan_rank1"] = _rank1_tickers
+    _save_rank1_to_db(_today_str, _rank1_tickers)
+    _add_scan_tickers_to_intraday(_today_str, _rank1_tickers)
+    _scan_placeholder.empty()
+    if _rank1_tickers:
+        st.toast(f"🎯 Auto-Scan found {len(_rank1_tickers)} Rank 1 tickers: {', '.join(_rank1_tickers)}", icon="🎯")
+        print(f"🎯 Auto-Scan Rank 1 (saved to DB): {_rank1_tickers}")
+    else:
+        print("🔬 Auto-Scan: No Rank 1 tickers found today.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN TABS — 6 Pages
@@ -4517,15 +5497,22 @@ with tab_plan:
         '</div></div></div>',
         unsafe_allow_html=True,
     )
+    # Build intraday ticker list from database (base + auto-scanned Rank 1)
+    _intraday_from_db = _load_intraday_tickers(_today_str)
+    _intraday_default = ", ".join(_intraday_from_db) if _intraday_from_db else "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, META, GOOG"
     plan_tickers_raw = st.text_area(
-        "Tickers (comma-separated)", value="SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, META, GOOG",
+        "Tickers (comma-separated)", value=_intraday_default,
         height=60, key="plan_tickers", label_visibility="collapsed",
     )
     plan_date = st.date_input("Plan date (close of this day)", value=date.today(), key="plan_date")
     plan_run = st.button("🗓️ GENERATE PLAN", use_container_width=True, type="primary", key="btn_plan")
-    check_open_run = st.button("☀️ CHECK OPEN PRICES", use_container_width=True, key="btn_check_open")
+    _btn_cols = st.columns(2)
+    with _btn_cols[0]:
+        check_open_run = st.button("☀️ CHECK OPEN PRICES", use_container_width=True, key="btn_check_open")
+    with _btn_cols[1]:
+        replay_run = st.button("🔁 REPLAY SESSION", use_container_width=True, key="btn_replay")
 
-    if not plan_run and not check_open_run:
+    if not plan_run and not check_open_run and not replay_run:
         st.markdown(
             '<div style="text-align:center;padding:50px 0">'
             '<div style="font-size:48px;margin-bottom:12px;opacity:.2">🗓️</div>'
@@ -4634,6 +5621,7 @@ if earnings_estimator_btn:
             "candle", "vol_action", "vol_trend", "vol_ratio", "poc", "val", "vah",
             "persistence", "quote_type",
             "entry", "stop_loss", "target1", "target2", "t1_days", "risk_pct",
+            "rr_t1", "rr_t2", "best_rr",
             "pe_ratio", "forward_pe", "peg_ratio", "valuation", "market_cap",
             "revenue_str", "revenue_growth", "earnings_growth",
             "profit_margin", "roe", "debt_to_equity", "beta",
@@ -4679,6 +5667,12 @@ if earnings_estimator_btn:
                 df["expected_avg"] = df["expected_avg"].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "")
             if "risk_pct" in df.columns:
                 df["risk_pct"] = df["risk_pct"].apply(lambda x: f"{x:.1f}%" if pd.notnull(x) and x else "")
+            for _rr_col in ["rr_t1", "rr_t2", "best_rr"]:
+                if _rr_col in df.columns:
+                    df[_rr_col] = df[_rr_col].apply(lambda x: f"{x:.2f}x" if pd.notnull(x) and isinstance(x, (int, float)) else x)
+            for _pcol in ["price", "entry", "stop_loss", "target1", "target2"]:
+                if _pcol in df.columns:
+                    df[_pcol] = df[_pcol].apply(lambda x: f"{x:.2f}" if pd.notnull(x) and isinstance(x, (int, float)) else x)
             if "persistence" in df.columns:
                 df["persistence"] = df["persistence"].apply(lambda x: f"{x:.0f}%" if pd.notnull(x) else "")
             return df
@@ -4709,7 +5703,9 @@ if earnings_estimator_btn:
             "target_upside": "Upside", "rec_key": "Rating",
             "num_analysts": "# Analysts", "week52_position": "52W Pos",
             "pct_from_high": "vs 52W Hi", "market_cap": "Mkt Cap",
-            "stop_loss": "Stop", "t1_days": "T1 (td)", "risk_pct": "Risk%", "flags": "Signals",
+            "stop_loss": "Stop", "t1_days": "T1 (td)", "risk_pct": "Risk%",
+            "rr_t1": "RR(T1)", "rr_t2": "RR(T2)", "best_rr": "Best RR",
+            "flags": "Signals",
         }
 
         # ── Color styling for Weekly / Daily / 4H / Signal columns ───────
@@ -5137,6 +6133,2026 @@ if dl_run:
             except Exception as exc:
                 st.error(f"Lookup error: {exc}")
 
+# ── Replay Session handler ─────────────────────────────────
+if replay_run:
+    # Compute replay date = next trading day after plan_date
+    _replay_date = plan_date + timedelta(days=1)
+    while _replay_date.weekday() >= 5:
+        _replay_date += timedelta(days=1)
+    # Clear previous session state for a fresh replay
+    st.session_state["open_check_table_rows"] = []
+    st.session_state["tracking_trades"] = []
+    st.session_state["replay_mode"] = True
+    st.session_state["replay_date"] = _replay_date
+    st.session_state["replay_time_min"] = 8 * 60 + 20  # Start at 8:20 AM CST
+    st.session_state["replay_playing"] = False
+    st.session_state["replay_speed"] = 10  # minutes per tick
+
+# ── Check Open Prices ──────────────────────────────────────
+# Clear replay mode if user clicks Check Open Prices directly (not via replay)
+if check_open_run and not replay_run:
+    st.session_state.pop("replay_mode", None)
+    st.session_state.pop("replay_date", None)
+    st.session_state.pop("replay_time_min", None)
+    st.session_state.pop("replay_playing", None)
+    st.session_state.pop("replay_speed", None)
+
+# Auto-trigger at 8:30 AM CST if plan exists and open check hasn't run yet
+_auto_check_open = (
+    not check_open_run
+    and not replay_run
+    and is_after_market_time(8, 30)
+    and plan_date == date.today()
+    and not st.session_state.get("open_check_table_rows")
+    and (st.session_state.get("plan_data") or not missing_creds)
+)
+_is_replay = replay_run or st.session_state.get("replay_mode", False)
+if check_open_run or _auto_check_open or replay_run:
+  with tab_plan:
+    saved_plan = st.session_state.get("plan_data", [])
+    if not saved_plan:
+        # Auto-generate plan if none exists
+        _should_auto_plan = (plan_date == date.today() or _is_replay) and not missing_creds
+        # Compute _prev (plan-from date) before branching so both paths can use it
+        if _is_replay:
+            _prev = plan_date
+        else:
+            _prev = plan_date - timedelta(days=1)
+            while _prev.weekday() >= 5:
+                _prev -= timedelta(days=1)
+        if _should_auto_plan:
+            st.info(f"⏳ No plan found — auto-generating plan for **{_prev.strftime('%A, %B %d')}**...")
+            _auto_tickers = [t.strip().upper() for t in plan_tickers_raw.strip().split(",") if t.strip()]
+            _auto_plan_rows = []
+            _auto_progress = st.progress(0)
+            for _ai, _aticker in enumerate(_auto_tickers):
+                _auto_progress.progress((_ai + 1) / len(_auto_tickers))
+                try:
+                    p_end = _prev
+                    p_start = p_end - timedelta(days=400)
+                    if data_source == "Alpaca":
+                        p_daily = get_daily_bars_alpaca(_aticker, str(p_start), str(p_end), api_key, api_secret)
+                    else:
+                        p_daily = get_daily_bars(_aticker, str(p_start), str(p_end), api_key)
+                    if p_daily is None or p_daily.empty or len(p_daily) < 60:
+                        continue
+                    daily_close = float(p_daily["close"].iloc[-1])
+                    daily_open  = float(p_daily["open"].iloc[-1])
+                    atr_14 = float((p_daily["high"] - p_daily["low"]).rolling(14).mean().iloc[-1])
+                    if daily_close > daily_open:
+                        direction = "LONG"
+                    elif daily_close < daily_open:
+                        direction = "SHORT"
+                    else:
+                        prev5 = p_daily["close"].iloc[-6:-1]
+                        direction = "LONG" if daily_close >= float(prev5.iloc[0]) else "SHORT"
+                    entry = round(daily_close, 2)
+                    recent_low  = float(p_daily["low"].iloc[-10:].min())
+                    recent_high = float(p_daily["high"].iloc[-10:].max())
+                    if direction == "LONG":
+                        stop_px = round(recent_low  - atr_14 * 0.3, 2)
+                    else:
+                        stop_px = round(recent_high + atr_14 * 0.3, 2)
+                    sig_full = _estimator_signal_at(p_daily, len(p_daily) - 1,
+                                                    use_fib=use_fib, fib_tol=fib_tol, ticker="")
+                    if sig_full is not None:
+                        verdict    = sig_full["verdict"]
+                        confidence = sig_full["confidence"]
+                        score      = sig_full["score"]
+                        fib_bias   = sig_full["fib_bias"]
+                        vol_bias   = sig_full["vol_bias"]
+                        vol_trend  = sig_full["vol_trend"]
+                        signals    = sig_full["signals"]
+                    else:
+                        verdict    = "LEAN BULLISH" if direction == "LONG" else "LEAN BEARISH"
+                        confidence = "LOW"
+                        score      = 2 if direction == "LONG" else -2
+                        fib_bias   = "N/A"
+                        vol_bias   = "N/A"
+                        vol_trend  = "N/A"
+                        signals    = "Day:BULL" if direction == "LONG" else "Day:BEAR"
+                    atr_1d = atr_14
+                    intra_stop_dist = round(atr_1d * 0.3, 2)
+                    intra_t1_dist = round(atr_1d * 0.5, 2)
+                    intra_t2_dist = round(atr_1d * 0.8, 2)
+                    if direction == "LONG":
+                        intra_stop = round(entry - intra_stop_dist, 2)
+                        intra_t1 = round(entry + intra_t1_dist, 2)
+                        intra_t2 = round(entry + intra_t2_dist, 2)
+                    else:
+                        intra_stop = round(entry + intra_stop_dist, 2)
+                        intra_t1 = round(entry - intra_t1_dist, 2)
+                        intra_t2 = round(entry - intra_t2_dist, 2)
+                    LISTED_INCS = [0.5, 1, 2, 2.5, 5, 10]
+                    spread_target = atr_14 * 0.40
+                    strike_inc = next((s for s in LISTED_INCS if s >= spread_target), LISTED_INCS[-1])
+                    min_inc = 0.5 if entry < 20 else (1 if entry < 50 else 2.5)
+                    max_inc = next((s for s in LISTED_INCS if s >= atr_14), LISTED_INCS[-1])
+                    strike_inc = max(strike_inc, min_inc)
+                    strike_inc = min(strike_inc, max_inc)
+                    atm_strike = round(round(entry / strike_inc) * strike_inc, 2)
+                    opt_type = "CALL" if direction == "LONG" else "PUT"
+                    def _next_trading_day(d, skip=1):
+                        result = d
+                        added = 0
+                        while added < skip:
+                            result += timedelta(days=1)
+                            if result.weekday() < 5:
+                                added += 1
+                        return result
+                    next_trade   = _next_trading_day(p_end, 1)
+                    trade_plus2  = _next_trading_day(p_end, 3)
+                    expiry_0dte  = next_trade.strftime("%m/%d")
+                    expiry_2dte  = trade_plus2.strftime("%m/%d")
+                    gap_threshold = round(entry * 0.005, 2)
+                    if direction == "LONG":
+                        open_above = f"Enter CALL at ~${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_between = f"Better entry between ${intra_stop:.2f}-${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_below_stop = f"Opens below ${intra_stop:.2f} — SKIP CALL, consider PUT"
+                        big_gap = f"Gap up >${gap_threshold:.2f} above ${entry:.2f} — wait for pullback near ${entry:.2f}"
+                    else:
+                        open_above = f"Opens above ${intra_stop:.2f} — SKIP PUT, consider CALL"
+                        open_between = f"Enter PUT at ~${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_below_stop = f"Better entry between ${entry:.2f}-${intra_stop:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        big_gap = f"Gap down >${gap_threshold:.2f} below ${entry:.2f} — wait for bounce near ${entry:.2f}"
+                    # RR ratios for auto-plan
+                    def _auto_rr(e, s, t, d):
+                        try:
+                            risk = (e - s) if d == "LONG" else (s - e)
+                            rew  = (t - e) if d == "LONG" else (e - t)
+                            return round(rew / risk, 2) if risk > 0 else 0.0
+                        except: return 0.0
+                    _rr1_ap = _auto_rr(entry, intra_stop, intra_t1, direction)
+                    _rr2_ap = _auto_rr(entry, intra_stop, intra_t2, direction)
+                    _best_rr_ap = max(_rr1_ap, _rr2_ap)
+                    _auto_plan_rows.append({
+                        "Ticker": _aticker, "Direction": direction, "Option": opt_type,
+                        "Verdict": verdict, "Confidence": confidence,
+                        "Close": round(entry, 2), "ATR": round(atr_1d, 2),
+                        "Intra Stop": round(intra_stop, 2), "Intra T1": round(intra_t1, 2), "Intra T2": round(intra_t2, 2),
+                        "RR(T1)": f"{_rr1_ap:.2f}x", "RR(T2)": f"{_rr2_ap:.2f}x", "Best RR": f"{_best_rr_ap:.2f}x",
+                        "_best_rr_sort": _best_rr_ap,
+                        "ATM Strike": round(atm_strike, 2),
+                        "0DTE Exp": expiry_0dte, "2-3DTE Exp": expiry_2dte,
+                        "If opens near entry": open_above if direction == "LONG" else open_between,
+                        "If opens between entry & stop": open_between if direction == "LONG" else open_above,
+                        "If opens past stop": open_below_stop, "If big gap": big_gap,
+                    })
+                except:
+                    continue
+            _auto_progress.empty()
+            if _auto_plan_rows:
+                _auto_plan_rows.sort(key=lambda x: x.get("_best_rr_sort", 0), reverse=True)
+                st.session_state["plan_data"] = _auto_plan_rows
+                saved_plan = _auto_plan_rows
+                st.success(f"✅ Auto-generated plan for {_prev.strftime('%m/%d')} with {len(_auto_plan_rows)} ticker(s)")
+            else:
+                st.warning("Could not auto-generate plan. Try generating manually.")
+        else:
+            # User clicked CHECK OPEN PRICES with no plan — auto-generate now
+            st.info(f"⏳ No plan found — auto-generating plan for **{_prev.strftime('%A, %B %d')}**...")
+            _auto_tickers = [t.strip().upper() for t in plan_tickers_raw.strip().split(",") if t.strip()]
+            _auto_plan_rows = []
+            _auto_progress_temp = st.progress(0)
+            for _ai, _aticker in enumerate(_auto_tickers):
+                _auto_progress_temp.progress((_ai + 1) / len(_auto_tickers))
+                try:
+                    p_end = _prev
+                    p_start = p_end - timedelta(days=400)
+                    if data_source == "Alpaca":
+                        p_daily = get_daily_bars_alpaca(_aticker, str(p_start), str(p_end), api_key, api_secret)
+                    else:
+                        p_daily = get_daily_bars(_aticker, str(p_start), str(p_end), api_key)
+                    if p_daily is None or p_daily.empty or len(p_daily) < 60:
+                        continue
+                    daily_close = float(p_daily["close"].iloc[-1])
+                    daily_open  = float(p_daily["open"].iloc[-1])
+                    atr_14 = float((p_daily["high"] - p_daily["low"]).rolling(14).mean().iloc[-1])
+                    if daily_close > daily_open:
+                        direction = "LONG"
+                    elif daily_close < daily_open:
+                        direction = "SHORT"
+                    else:
+                        prev5 = p_daily["close"].iloc[-6:-1]
+                        direction = "LONG" if daily_close >= float(prev5.iloc[0]) else "SHORT"
+                    entry = round(daily_close, 2)
+                    recent_low  = float(p_daily["low"].iloc[-10:].min())
+                    recent_high = float(p_daily["high"].iloc[-10:].max())
+                    if direction == "LONG":
+                        stop_px = round(recent_low  - atr_14 * 0.3, 2)
+                    else:
+                        stop_px = round(recent_high + atr_14 * 0.3, 2)
+                    sig_full = _estimator_signal_at(p_daily, len(p_daily) - 1, use_fib=use_fib, fib_tol=fib_tol, ticker="")
+                    if sig_full is not None:
+                        verdict    = sig_full["verdict"]
+                        confidence = sig_full["confidence"]
+                        score      = sig_full["score"]
+                        signals    = sig_full["signals"]
+                    else:
+                        verdict    = "LEAN BULLISH" if direction == "LONG" else "LEAN BEARISH"
+                        confidence = "LOW"
+                        score      = 2 if direction == "LONG" else -2
+                        signals    = "Day:BULL" if direction == "LONG" else "Day:BEAR"
+                    atr_1d = atr_14
+                    intra_stop_dist = round(atr_1d * 0.3, 2)
+                    intra_t1_dist = round(atr_1d * 0.5, 2)
+                    intra_t2_dist = round(atr_1d * 0.8, 2)
+                    if direction == "LONG":
+                        intra_stop = round(entry - intra_stop_dist, 2)
+                        intra_t1 = round(entry + intra_t1_dist, 2)
+                        intra_t2 = round(entry + intra_t2_dist, 2)
+                    else:
+                        intra_stop = round(entry + intra_stop_dist, 2)
+                        intra_t1 = round(entry - intra_t1_dist, 2)
+                        intra_t2 = round(entry - intra_t2_dist, 2)
+                    LISTED_INCS = [0.5, 1, 2, 2.5, 5, 10]
+                    spread_target = atr_14 * 0.40
+                    strike_inc = next((s for s in LISTED_INCS if s >= spread_target), LISTED_INCS[-1])
+                    min_inc = 0.5 if entry < 20 else (1 if entry < 50 else 2.5)
+                    max_inc = next((s for s in LISTED_INCS if s >= atr_14), LISTED_INCS[-1])
+                    strike_inc = max(strike_inc, min_inc)
+                    strike_inc = min(strike_inc, max_inc)
+                    atm_strike = round(round(entry / strike_inc) * strike_inc, 2)
+                    opt_type = "CALL" if direction == "LONG" else "PUT"
+                    def _next_trading_day_temp(d, skip=1):
+                        result = d
+                        added = 0
+                        while added < skip:
+                            result += timedelta(days=1)
+                            if result.weekday() < 5:
+                                added += 1
+                        return result
+                    next_trade   = _next_trading_day_temp(p_end, 1)
+                    trade_plus2  = _next_trading_day_temp(p_end, 3)
+                    expiry_0dte  = next_trade.strftime("%m/%d")
+                    expiry_2dte  = trade_plus2.strftime("%m/%d")
+                    gap_threshold = round(entry * 0.005, 2)
+                    if direction == "LONG":
+                        open_above = f"Enter CALL at ~${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_between = f"Better entry between ${intra_stop:.2f}-${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_below_stop = f"Opens below ${intra_stop:.2f} — SKIP CALL, consider PUT"
+                        big_gap = f"Gap up >${gap_threshold:.2f} above ${entry:.2f} — wait for pullback near ${entry:.2f}"
+                    else:
+                        open_above = f"Opens above ${intra_stop:.2f} — SKIP PUT, consider CALL"
+                        open_between = f"Enter PUT at ~${entry:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        open_below_stop = f"Better entry between ${entry:.2f}-${intra_stop:.2f} — stop ${intra_stop:.2f}, T1 ${intra_t1:.2f}, T2 ${intra_t2:.2f}"
+                        big_gap = f"Gap down >${gap_threshold:.2f} below ${entry:.2f} — wait for bounce near ${entry:.2f}"
+                    # RR ratios for auto-plan (temp)
+                    def _auto_rr_t(e, s, t, d):
+                        try:
+                            risk = (e - s) if d == "LONG" else (s - e)
+                            rew  = (t - e) if d == "LONG" else (e - t)
+                            return round(rew / risk, 2) if risk > 0 else 0.0
+                        except: return 0.0
+                    _rr1_apt = _auto_rr_t(entry, intra_stop, intra_t1, direction)
+                    _rr2_apt = _auto_rr_t(entry, intra_stop, intra_t2, direction)
+                    _best_rr_apt = max(_rr1_apt, _rr2_apt)
+                    _auto_plan_rows.append({
+                        "Ticker": _aticker, "Direction": direction, "Option": opt_type,
+                        "Verdict": verdict, "Confidence": confidence,
+                        "Close": round(entry, 2), "ATR": round(atr_1d, 2),
+                        "Intra Stop": round(intra_stop, 2), "Intra T1": round(intra_t1, 2), "Intra T2": round(intra_t2, 2),
+                        "RR(T1)": f"{_rr1_apt:.2f}x", "RR(T2)": f"{_rr2_apt:.2f}x", "Best RR": f"{_best_rr_apt:.2f}x",
+                        "_best_rr_sort": _best_rr_apt,
+                        "ATM Strike": round(atm_strike, 2),
+                        "0DTE Exp": expiry_0dte, "2-3DTE Exp": expiry_2dte,
+                        "If opens near entry": open_above if direction == "LONG" else open_between,
+                        "If opens between entry & stop": open_between if direction == "LONG" else open_above,
+                        "If opens past stop": open_below_stop, "If big gap": big_gap,
+                    })
+                except:
+                    continue
+            _auto_progress_temp.empty()
+            if _auto_plan_rows:
+                _auto_plan_rows.sort(key=lambda x: x.get("_best_rr_sort", 0), reverse=True)
+                st.session_state["plan_data"] = _auto_plan_rows
+                saved_plan = _auto_plan_rows
+                st.success(f"✅ Auto-generated plan for {_prev.strftime('%m/%d')} with {len(_auto_plan_rows)} ticker(s)")
+                st.rerun()
+            else:
+                st.warning("Could not auto-generate plan. Try generating manually.")
+    if saved_plan and not YFINANCE_AVAILABLE:
+        st.error("yfinance is required for live price checks.")
+    elif saved_plan:
+        # In replay mode, use the replay date instead of plan_date
+        if _is_replay and st.session_state.get("replay_date"):
+            check_date = st.session_state["replay_date"]
+            is_live = False
+            st.info(f"🔁 **REPLAY MODE** — Simulating session for **{check_date.strftime('%A, %B %d, %Y')}**")
+        else:
+            check_date = plan_date
+            is_live    = (check_date == date.today())
+        
+        # Add toggle to skip options data
+        skip_options = st.checkbox("⏭️ Skip options data (faster)", value=False, 
+                                   help="Disable options chain fetching to speed up price checks")
+        
+        actual_trade_date = None
+        open_status = st.empty()
+        fetch_errors = []
+        fetch_success = []
+        shown = 0
+        table_rows = []  # Collect all scenario results for table
+        
+        status_cols = st.columns([1, 2])
+        with status_cols[0]:
+            skip_indicator = st.empty()
+        with status_cols[1]:
+            progress_text = st.empty()
+
+        for i, r in enumerate(saved_plan):
+            if not isinstance(r, dict):
+                continue
+            ticker = r.get("Ticker") or r.get("ticker", "UNKNOWN")
+            
+            # Update status indicators
+            skip_indicator.info(f"⏭️ Skip options: {'ON' if skip_options else 'OFF'}")
+            progress_text.text(f"📊 {shown}/{i} displayed • Fetching {ticker}... ({i+1}/{len(saved_plan)})")
+            
+            try:
+                # Pull every field defensively — handles stale plan rows
+                entry      = r.get("Close") or r.get("entry")
+                intra_stop = r.get("Intra Stop")
+                intra_t1   = r.get("Intra T1")
+                intra_t2   = r.get("Intra T2")
+                atm_strike = r.get("ATM Strike")
+                atr_val    = r.get("ATR")
+                direction  = r.get("Direction")
+                opt_type   = r.get("Option")
+                confidence = r.get("Confidence", "N/A")
+                exp_0dte   = r.get("0DTE Exp", "")
+                exp_2dte   = r.get("2-3DTE Exp", "")
+                txt_gap    = r.get("If big gap", "N/A")
+                txt_near   = r.get("If opens near entry", "N/A")
+                txt_btwn   = r.get("If opens between entry & stop", "N/A")
+                txt_past   = r.get("If opens past stop", "N/A")
+
+                missing = [k for k, v in {
+                    "Close": entry, "Intra Stop": intra_stop, "Intra T1": intra_t1,
+                    "ATM Strike": atm_strike, "ATR": atr_val, "Direction": direction,
+                }.items() if v is None]
+                if missing:
+                    fetch_errors.append(f"{ticker}: missing {missing} — regenerate plan")
+                    continue
+
+                entry=float(entry); intra_stop=float(intra_stop); intra_t1=float(intra_t1)
+                intra_t2=float(intra_t2) if intra_t2 is not None else intra_t1
+                atm_strike=float(atm_strike); atr_val=float(atr_val)
+
+                # Fetch live price via yfinance (with timeout handling)
+                import signal
+                def _timeout_handler(signum, frame):
+                    raise TimeoutError(f"Timeout fetching {ticker} data")
+                
+                tk = yf.Ticker(ticker)
+                today_hist = None
+
+                # Build resilient fetch windows for live/replay/backdated checks.
+                # Backdated dates can land on weekends/holidays, so we probe nearby windows.
+                fetch_windows = []
+                if is_live:
+                    fetch_windows = [{"period": "1d"}, {"period": "5d"}]
+                elif _is_replay:
+                    fetch_windows = [
+                        {"start": str(check_date), "end": str(check_date + timedelta(days=1))},
+                        {"start": str(check_date - timedelta(days=2)), "end": str(check_date + timedelta(days=2))},
+                    ]
+                else:
+                    # Backdated mode: target date might be weekend/holiday, so expand windows
+                    fetch_windows = [
+                        # 1. Exact date (if trading day)
+                        {"start": str(check_date), "end": str(check_date + timedelta(days=1))},
+                        # 2. ±5 days (catches nearby trading day)
+                        {"start": str(check_date - timedelta(days=5)), "end": str(check_date + timedelta(days=5))},
+                        # 3. ±10 days (wider window, def has data)
+                        {"start": str(check_date - timedelta(days=10)), "end": str(check_date + timedelta(days=10))},
+                        # 4. Last 6 months (fallback everything)
+                        {"period": "6mo"},
+                    ]
+
+                try:
+                    for _win in fetch_windows:
+                        if "period" in _win:
+                            _hist = tk.history(period=_win["period"])
+                        else:
+                            _hist = tk.history(start=_win["start"], end=_win["end"])
+                        if _hist is not None and not _hist.empty:
+                            today_hist = _hist
+                            break
+                except TimeoutError as te:
+                    fetch_errors.append(f"{ticker}: timeout fetching stock data")
+                    print(f"⏱️ {ticker}: {te}")
+                    continue
+                except Exception as e:
+                    print(f"📡 {ticker} data fetch error: {type(e).__name__}: {e}")
+
+                if today_hist is None or (hasattr(today_hist, "empty") and today_hist.empty):
+                    fetch_errors.append(
+                        f"{ticker}: no data for {check_date} (weekend/holiday/invalid ticker)"
+                    )
+                    continue
+
+                # ── Robust price extraction — handles all yfinance column formats ──
+                # yfinance can return: plain columns, MultiIndex (field, ticker),
+                # or MultiIndex (ticker, field) depending on version and ticker alias.
+                def _extract_price(df, field, row_idx):
+                    """Extract a single price value from a yfinance DataFrame robustly."""
+                    cols = df.columns
+                    # 1. Plain columns: ["Open", "High", ...]
+                    if field in cols:
+                        val = df[field].iloc[row_idx]
+                        if val is not None and str(val) != "nan":
+                            return float(val)
+                    # 2. MultiIndex — try (field, *) pattern
+                    if hasattr(cols, "levels"):
+                        for col in cols:
+                            if isinstance(col, tuple) and col[0] == field:
+                                val = df[col].iloc[row_idx]
+                                if val is not None and str(val) != "nan":
+                                    return float(val)
+                        # 3. MultiIndex — try (*, field) pattern
+                        for col in cols:
+                            if isinstance(col, tuple) and col[-1] == field:
+                                val = df[col].iloc[row_idx]
+                                if val is not None and str(val) != "nan":
+                                    return float(val)
+                    # 4. Last resort — positional (Open=col0, Close=col3)
+                    pos = {"Open": 0, "Close": 3}
+                    if field in pos and len(df.columns) > pos[field]:
+                        val = df.iloc[row_idx, pos[field]]
+                        if val is not None:
+                            return float(val)
+                    raise ValueError(f"Cannot extract {field} from DataFrame columns: {list(cols)[:6]}")
+
+                open_price    = _extract_price(today_hist, "Open",  0)
+                current_price = _extract_price(today_hist, "Close", -1)
+
+                # Fetch option data for the strike
+                opt_prev_open = opt_prev_high = opt_prev_low = opt_prev_close = opt_curr_open = None
+                if not skip_options:
+                    try:
+                        # Try yfinance first
+                        stock = yf.Ticker(ticker)
+                        expirations = stock.options
+                        if expirations:
+                            exp_date = expirations[0]
+                            opt_chain = stock.option_chain(exp_date)
+                            calls = opt_chain.calls if opt_type == "CALL" else opt_chain.puts
+                            calls = calls.sort_values(by='strike')
+                            closest_strike = calls.iloc[(calls['strike'] - atm_strike).abs().argsort()[0]]
+                            if not closest_strike.empty:
+                                opt_curr_open = closest_strike.get('lastPrice', None)
+                                opt_prev_open = opt_curr_open
+                                opt_prev_close = opt_curr_open
+                    except Exception as opt_err:
+                        print(f"📊 {ticker} yfinance options error: {type(opt_err).__name__}: {opt_err}")
+                        # Fallback to Alpaca
+                        try:
+                            if api_key and api_secret:
+                                headers = {
+                                    'APCA-API-KEY-ID': api_key,
+                                    'APCA-API-SECRET-KEY': api_secret,
+                                }
+                                base_url = "https://api.alpaca.markets"
+                                resp = requests.get(
+                                    f"{base_url}/v1beta1/options/snapshots/{ticker}",
+                                    headers=headers,
+                                    timeout=10
+                                )
+                                if resp.status_code == 200:
+                                    data = resp.json()
+                                    snapshots = data.get('snapshots', [])
+                                    for snap in snapshots:
+                                        contract = snap.get('option_details', {})
+                                        strike = contract.get('strike_price')
+                                        if strike and abs(strike - atm_strike) < 0.5:
+                                            opt_curr_open = snap.get('latest_quote', {}).get('last_quote', {}).get('ask')
+                                            if opt_curr_open:
+                                                opt_prev_open = opt_curr_open
+                                                opt_prev_close = opt_curr_open
+                                            break
+                        except Exception as alp_err:
+                            print(f"📊 {ticker} Alpaca options fallback error: {type(alp_err).__name__}")
+                else:
+                    print(f"⏭️ {ticker}: skipping options data per user request")
+
+                if actual_trade_date is None:
+                    actual_trade_date = str(today_hist.index[0])[:10]
+                    date_label = "Live" if is_live else actual_trade_date
+
+                gap_thr  = round(entry * 0.005, 2)
+                move_raw = open_price - entry
+                move_pct = move_raw / entry * 100
+
+                if direction == "LONG":
+                    if open_price - entry > gap_thr:
+                        sc,lb,col,txt = "big_gap",   "⚠️ BIG GAP UP",               "#f5c842", txt_gap
+                    elif open_price >= entry:
+                        sc,lb,col,txt = "near_entry","✅ OPENS NEAR ENTRY",               "#00e5a0", txt_near
+                    elif open_price > intra_stop:
+                        sc,lb,col,txt = "between",   "⚡ OPENS BETWEEN ENTRY & STOP",     "#4d9fff", txt_btwn
+                    else:
+                        sc,lb,col,txt = "past_stop", "❌ OPENS PAST STOP",                "#ff4d6a", txt_past
+                else:
+                    if entry - open_price > gap_thr:
+                        sc,lb,col,txt = "big_gap",   "⚠️ BIG GAP DOWN",             "#f5c842", txt_gap
+                    elif open_price <= entry:
+                        sc,lb,col,txt = "near_entry","✅ OPENS NEAR ENTRY",               "#00e5a0", txt_near
+                    elif open_price < intra_stop:
+                        sc,lb,col,txt = "between",   "⚡ OPENS BETWEEN ENTRY & STOP",     "#4d9fff", txt_btwn
+                    else:
+                        sc,lb,col,txt = "past_stop", "❌ OPENS PAST STOP",                "#ff4d6a", txt_past
+
+                dd=direction; dopt=opt_type or "CALL"
+                ds=intra_stop; dt1=intra_t1; dt2=intra_t2; da=atm_strike
+
+                if sc == "past_stop":
+                    fd=round(atr_val*0.3,2); f1=round(atr_val*0.5,2); f2=round(atr_val*0.8,2)
+                    if direction == "LONG":
+                        dd="SHORT"; dopt="PUT"
+                        ds=round(open_price+fd,2); dt1=round(open_price-f1,2); dt2=round(open_price-f2,2)
+                    else:
+                        dd="LONG";  dopt="CALL"
+                        ds=round(open_price-fd,2); dt1=round(open_price+f1,2); dt2=round(open_price+f2,2)
+                    si = 5 if open_price>=200 else (2.5 if open_price>=50 else (1 if open_price>=20 else 0.5))
+                    da  = round(round(open_price/si)*si, 2)
+                    txt = f"Flipped to {dopt} at ~${open_price:.2f} — stop ${ds:.2f}, T1 ${dt1:.2f}, T2 ${dt2:.2f}"
+
+                dc  = "#00e5a0" if dd == "LONG" else "#ff4d6a"
+                ico = "📞" if dopt == "CALL" else "📉"
+                shown += 1
+                fetch_success.append(ticker)
+                progress_text.text(f"✅ {shown}/{i+1} displayed • {ticker}")
+
+                # ── Per-ticker detail cards (inside collapsed expander) ──
+                if '_check_open_expander' not in dir():
+                    _check_open_expander = st.expander(f"☀️ Morning Open — Which Scenario? ({date_label})", expanded=False)
+                with _check_open_expander:
+                    st.markdown(
+                        f'<div style="background:#0d0f17;border:1px solid #1a1d2e;border-left:4px solid {col};'
+                        f'padding:14px 18px;border-radius:4px;margin-bottom:8px">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+                        f'<span style="font-size:15px;font-weight:900;color:#e8ecff">{ico} {ticker} — {dopt}'
+                        f'{"  🔄 FLIPPED" if sc=="past_stop" else ""}</span>'
+                        f'<span style="color:{dc};font-weight:700;font-size:12px">{dd} · {confidence}</span>'
+                        f'</div>'
+                        f'<div style="display:flex;gap:16px;font-size:12px;margin-bottom:8px;flex-wrap:wrap">'
+                        f'<span style="color:#6b7099">Prev Close: <b style="color:#e8ecff">${entry:.2f}</b></span>'
+                        f'<span style="color:#6b7099">Open: <b style="color:#f5c842">${open_price:.2f}</b></span>'
+                        f'<span style="color:#6b7099">Current: <b style="color:#a78bfa">${current_price:.2f}</b></span>'
+                        f'<span style="color:#6b7099">Move: <b style="color:{"#00e5a0" if move_raw>=0 else "#ff4d6a"}>'
+                        f'{"+" if move_raw>=0 else ""}${move_raw:.2f} ({move_pct:+.2f}%)</b></span>'
+                        f'</div>'
+                        f'<div style="background:{col}15;border:1px solid {col}40;'
+                        f'border-radius:6px;padding:10px 14px;margin-bottom:6px">'
+                        f'<div style="font-size:13px;font-weight:700;color:{col};margin-bottom:4px">{lb}</div>'
+                        f'<div style="font-size:11px;color:#e8ecff">{txt}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # ── Spread suggestion ─────────────────────────────────────
+                _sinc   = 5 if da >= 200 else (2.5 if da >= 50 else (1 if da >= 20 else 0.5))
+                _raw    = (da - atr_val * 2) if dopt == "PUT" else (da + atr_val * 2)
+                _leg2   = round(round(_raw / _sinc) * _sinc, 2)
+                _spread = f"{da:.0f}–{_leg2:.0f}"
+
+                with _check_open_expander:
+                    st.markdown(
+                        f'<div style="font-size:10px;color:#6b7099;padding:4px 18px 0">'
+                        f'ATR: <b style="color:#a78bfa">${atr_val:.2f}</b> &nbsp;·&nbsp; '
+                        f'Stop: ${ds:.2f} &nbsp;·&nbsp; T1: ${dt1:.2f} &nbsp;·&nbsp; T2: ${dt2:.2f} &nbsp;·&nbsp; '
+                        f'ATM: <b style="color:{dc}">${da:.0f} {dopt}</b> &nbsp;·&nbsp; Exp: {exp_0dte} / {exp_2dte}</div>'
+                        f'<div style="font-size:11px;font-weight:600;color:#4d9fff;padding:3px 18px 12px">'
+                        f'{ticker} &nbsp; {dopt} SPREAD &nbsp; {_spread} &nbsp; Exp: {exp_0dte} / {exp_2dte}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # Calculate RR ratios
+                def _calc_table_rr(entry_val, stop_val, target_val, direction_val):
+                    try:
+                        if direction_val == "LONG":
+                            risk = entry_val - stop_val
+                            reward = target_val - entry_val
+                        else:
+                            risk = stop_val - entry_val
+                            reward = entry_val - target_val
+                        return round(reward / risk, 2) if risk > 0 else 0.0
+                    except: return 0.0
+                rr_t1_calc = _calc_table_rr(entry, ds, dt1, dd)
+                rr_t2_calc = _calc_table_rr(entry, ds, dt2, dd)
+                best_rr_calc = max(rr_t1_calc, rr_t2_calc)
+
+                # Append row to table
+                table_rows.append({
+                    "Ticker": ticker,
+                    "Direction": dd,
+                    "Option": dopt,
+                    "Stop": f"${ds:.2f}",
+                    "ATM": f"${da:.0f}",
+                    "Spread": _spread,
+                    "Exp 0DTE": exp_0dte,
+                    "Exp 2-3DTE": exp_2dte,
+                    "Confidence": confidence,
+                    "ATR": f"${atr_val:.2f}",
+                    "Prev Close": f"${entry:.2f}",
+                    "Prev Opt O": f"${opt_prev_open:.2f}" if opt_prev_open else "N/A",
+                    "Prev Opt H": f"${opt_prev_high:.2f}" if opt_prev_high else "N/A",
+                    "Prev Opt L": f"${opt_prev_low:.2f}" if opt_prev_low else "N/A",
+                    "Prev Opt C": f"${opt_prev_close:.2f}" if opt_prev_close else "N/A",
+                    "Open": f"${open_price:.2f}",
+                    "Opt Open": f"${opt_curr_open:.2f}" if opt_curr_open else "N/A",
+                    "T1": f"${dt1:.2f}",
+                    "T2": f"${dt2:.2f}",
+                    "RR(T1)": f"{rr_t1_calc:.2f}x",
+                    "RR(T2)": f"{rr_t2_calc:.2f}x",
+                    "Best RR": f"{best_rr_calc:.2f}x",
+                    "Current": f"${current_price:.2f}",
+                    "Move": f"${move_raw:.2f} ({move_pct:+.2f}%)",
+                    "Scenario": lb,
+                    "Notes": txt,  # Store full notes (untruncated) for gap entry extraction
+                    "_scenario_id": sc,
+                    "_best_rr_sort_main": best_rr_calc,
+                })
+            except Exception as exc:
+                import traceback
+                _tb_lines = traceback.format_exc().strip().split("\n")
+                _tb_last = _tb_lines[-3] if len(_tb_lines) >= 3 else ""
+                fetch_errors.append(f"{ticker}: {type(exc).__name__}: {exc} | {_tb_last.strip()}")
+
+        progress_text.empty()
+        skip_indicator.empty()
+        
+        # ── Summary: show tickers processed vs displayed ──
+        total_plan = len([r for r in saved_plan if isinstance(r, dict)])
+        missing_tickers = [r.get("Ticker") or r.get("ticker", "?") for r in saved_plan 
+                          if isinstance(r, dict) and (r.get("Ticker") or r.get("ticker")) not in fetch_success]
+        
+        st.markdown("---")
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        with summary_col1:
+            st.metric("✅ Successful", len(fetch_success))
+        with summary_col2:
+            st.metric("❌ Failed", len(fetch_errors))
+        with summary_col3:
+            st.metric("📊 Skip Options", "ON" if skip_options else "OFF")
+        
+        if shown == 0 and not fetch_errors:
+            st.info("No data returned — market may not be open yet, or try unchecking 'Skip options data'.")
+        
+        if fetch_errors:
+            with st.expander(f"⚠️ {len(fetch_errors)} issue(s) — hidden debug details", expanded=False):
+                st.markdown("**Failed Tickers:**")
+                for e in fetch_errors:
+                    st.code(e, language="text")
+                if missing_tickers:
+                    st.markdown(f"**Summary:** Missing {len(missing_tickers)} tickers: {', '.join(missing_tickers)}")
+        
+        if fetch_success:
+            st.caption(f"✅ Successfully displayed: {', '.join(fetch_success)}")
+
+        if not table_rows and shown == 0:
+            st.error("❌ No scenarios could be classified. Check the hidden debug section above.")
+
+        # Persist table_rows so they survive st.rerun() after track-button clicks
+        if table_rows:
+            st.session_state["open_check_table_rows"] = table_rows
+
+# ── Display persisted scenario tables & tracker (survives rerun) ──
+if st.session_state.get("open_check_table_rows"):
+  with tab_plan:
+    table_rows = st.session_state["open_check_table_rows"]
+    st.markdown("---")
+
+    # Replay time helper
+    _replay_time_min = st.session_state.get("replay_time_min", 500)
+    def _fmt_replay_time(m=None):
+        mins = m if m is not None else _replay_time_min
+        h, mi = divmod(mins, 60)
+        ampm = "AM" if h < 12 else "PM"
+        h12 = h if h <= 12 else h - 12
+        return f"{h12}:{mi:02d} {ampm} CST"
+
+    def _replay_clock(stage_min, label):
+        """Show a time marker. stage_min = minutes-since-midnight for this stage."""
+        if not st.session_state.get("replay_mode"):
+            return
+        reached = _replay_time_min >= stage_min
+        color = "#00e5a0" if reached else "#4a4a6a"
+        icon = "✅" if reached else "⏳"
+        h, mi = divmod(stage_min, 60)
+        ampm = "AM" if h < 12 else "PM"
+        h12 = h if h <= 12 else h - 12
+        time_str = f"{h12}:{mi:02d} {ampm} CST"
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;padding:6px 12px;'
+            f'background:linear-gradient(90deg,#1a1a2e,#16213e);border-left:3px solid {color};'
+            f'border-radius:4px;margin:8px 0;opacity:{"1" if reached else "0.5"}">'
+            f'<span style="font-size:16px">{icon}</span>'
+            f'<span style="font-family:monospace;font-size:18px;color:{color};font-weight:700">{time_str}</span>'
+            f'<span style="color:#8892b0;font-size:13px">│</span>'
+            f'<span style="color:{"#ccd6f6" if reached else "#5a5a7a"};font-size:13px">{label}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    # Show replay banner with time controller
+    if st.session_state.get("replay_mode"):
+        _rp_date = st.session_state.get("replay_date")
+        _rp_playing = st.session_state.get("replay_playing", False)
+        _rp_speed = st.session_state.get("replay_speed", 10)
+        _market_open = 8 * 60 + 20   # 8:20 AM CST
+        _market_close = 15 * 60      # 3:00 PM CST
+
+        # ── Auto-advance fragment (only when playing) ──
+        if _rp_playing and _replay_time_min < _market_close:
+            @st.fragment(run_every=timedelta(seconds=3))
+            def _replay_auto_tick():
+                _cur = st.session_state.get("replay_time_min", _market_open)
+                _spd = st.session_state.get("replay_speed", 10)
+                if st.session_state.get("replay_playing") and _cur < _market_close:
+                    st.session_state["replay_time_min"] = min(_cur + _spd, _market_close)
+                    if st.session_state["replay_time_min"] >= _market_close:
+                        st.session_state["replay_playing"] = False
+            _replay_auto_tick()
+
+        # ── Header ──
+        st.markdown(
+            f'<div style="background:linear-gradient(90deg,#0a0a1a,#1a1a3e);padding:12px 16px;'
+            f'border-radius:8px;border:1px solid #2a2a4a;margin-bottom:8px">'
+            f'<div style="display:flex;align-items:center;justify-content:space-between">'
+            f'<div><span style="font-size:14px;color:#8892b0">🔁 REPLAY</span> '
+            f'<span style="font-size:14px;color:#ccd6f6;font-weight:600">{_rp_date.strftime("%A, %B %d, %Y") if _rp_date else "N/A"}</span></div>'
+            f'<div style="font-family:monospace;font-size:36px;font-weight:700;color:#4d9fff;letter-spacing:2px">'
+            f'{"▶" if _rp_playing else "⏸"} {_fmt_replay_time()}</div>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Time slider ──
+        _slider_val = st.slider(
+            "Session Time",
+            min_value=_market_open,
+            max_value=_market_close,
+            value=_replay_time_min,
+            step=5,
+            format="%d",
+            key="rp_slider",
+            label_visibility="collapsed",
+        )
+        # If user dragged the slider, update time and pause
+        if _slider_val != _replay_time_min:
+            st.session_state["replay_time_min"] = _slider_val
+            st.session_state["replay_playing"] = False
+            st.rerun()
+
+        # ── Time markers along the bar ──
+        _t_labels = st.columns(8)
+        _markers = [
+            (8*60+20, "8:20"), (8*60+30, "8:30"), (9*60, "9:00"), (9*60+30, "9:30"),
+            (10*60, "10:00"), (11*60, "11:00"), (13*60, "1:00p"), (15*60, "3:00p"),
+        ]
+        for i, (mmin, mlbl) in enumerate(_markers):
+            _reached = _replay_time_min >= mmin
+            _clr = "#00e5a0" if _reached else "#4a4a6a"
+            _t_labels[i].markdown(
+                f'<div style="text-align:center;font-family:monospace;font-size:11px;color:{_clr};'
+                f'font-weight:{"700" if _reached else "400"}">{"●" if _reached else "○"} {mlbl}</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Control buttons ──
+        _c1, _c2, _c3, _c4, _c5, _c6, _c7, _c8 = st.columns([1, 1, 1, 1, 1, 1, 1, 1])
+        with _c1:
+            if _rp_playing:
+                if st.button("⏸ Pause", key="rp_pause", use_container_width=True):
+                    st.session_state["replay_playing"] = False
+                    st.rerun()
+            else:
+                if st.button("▶ Play", key="rp_play", use_container_width=True, type="primary"):
+                    st.session_state["replay_playing"] = True
+                    st.rerun()
+        with _c2:
+            if st.button("⏭ +10m", key="rp_fwd_10", use_container_width=True):
+                st.session_state["replay_playing"] = False
+                st.session_state["replay_time_min"] = min(_replay_time_min + 10, _market_close)
+                st.rerun()
+        with _c3:
+            if st.button("⏭ +30m", key="rp_fwd_30", use_container_width=True):
+                st.session_state["replay_playing"] = False
+                st.session_state["replay_time_min"] = min(_replay_time_min + 30, _market_close)
+                st.rerun()
+        with _c4:
+            if st.button("⏭ +1h", key="rp_fwd_60", use_container_width=True):
+                st.session_state["replay_playing"] = False
+                st.session_state["replay_time_min"] = min(_replay_time_min + 60, _market_close)
+                st.rerun()
+        with _c5:
+            if st.button("⏩ Close", key="rp_eod", use_container_width=True):
+                st.session_state["replay_playing"] = False
+                st.session_state["replay_time_min"] = _market_close
+                st.rerun()
+        with _c6:
+            if st.button("⏪ Reset", key="rp_reset", use_container_width=True):
+                st.session_state["replay_playing"] = False
+                st.session_state["replay_time_min"] = _market_open
+                st.rerun()
+        with _c7:
+            _speed_opts = {5: "5m", 10: "10m", 30: "30m"}
+            _speed_label = f"⚡{_speed_opts.get(_rp_speed, f'{_rp_speed}m')}/tick"
+            if st.button(_speed_label, key="rp_speed_toggle", use_container_width=True):
+                _speeds = [5, 10, 30]
+                _next_idx = (_speeds.index(_rp_speed) + 1) % len(_speeds) if _rp_speed in _speeds else 0
+                st.session_state["replay_speed"] = _speeds[_next_idx]
+                st.rerun()
+        with _c8:
+            if st.button("❌ Exit", key="btn_exit_replay", use_container_width=True):
+                st.session_state.pop("replay_mode", None)
+                st.session_state.pop("replay_date", None)
+                st.session_state.pop("replay_time_min", None)
+                st.session_state.pop("replay_playing", None)
+                st.session_state.pop("replay_speed", None)
+                st.session_state["open_check_table_rows"] = []
+                st.session_state["tracking_trades"] = []
+                st.rerun()
+
+    _replay_clock(8 * 60 + 20, "Pre-market — Fetching open prices & classifying scenarios")
+
+    conf_priority = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    near_entry_rows = [r for r in table_rows if r.get("Scenario", "").strip().startswith("✅ OPENS NEAR ENTRY")]
+    
+    # Extract gap scenarios - check multiple field patterns
+    gap_rows = []
+    for r in table_rows:
+        scenario = r.get("Scenario", "")
+        # Check for both emoji format and text format
+        if "GAP" in scenario.upper():
+            gap_rows.append(r)
+    
+    # BIG GAP scenarios as "secondary tracking candidates" at 8:30 AM
+    secondary_tracking_candidates = gap_rows
+    
+    # Debug: show what was extracted
+    if gap_rows:
+        st.caption(f"✅ Found {len(gap_rows)} gap scenario(s)")
+    else:
+        st.caption(f"ℹ️ No gap scenarios found (total scenarios: {len(table_rows)})")
+    _in_replay = st.session_state.get("replay_mode", False)
+    if _in_replay:
+        auto_track_enabled = _replay_time_min >= 8 * 60 + 30       # 8:30 AM
+        early_confirmation_enabled = _replay_time_min >= 8 * 60 + 30  # 8:30 AM
+        entry_confirmation_enabled = _replay_time_min >= 9 * 60       # 9:00 AM
+    else:
+        auto_track_enabled = is_after_market_time(8, 30)
+        entry_confirmation_enabled = is_after_market_time(9, 0)
+        early_confirmation_enabled = is_after_market_time(8, 30)
+
+    # Ensure tracking list exists
+    if "tracking_trades" not in st.session_state:
+        st.session_state["tracking_trades"] = []
+
+    def _make_track_entry(trade):
+        """Build a tracking dict from a table row, pre-computing RR ratios."""
+        def _p(v):
+            try: return float(str(v).replace("$","").replace(",",""))
+            except: return 0.0
+        entry = _p(trade.get("Open") or trade.get("Entry") or "0")
+        stop  = _p(trade.get("Stop")  or "0")
+        t1    = _p(trade.get("T1")    or "0")
+        t2    = _p(trade.get("T2")    or "0")
+        dirn  = trade.get("Direction", "LONG")
+        def _rr(e, s, t, d):
+            try:
+                risk = (e - s) if d == "LONG" else (s - e)
+                rew  = (t - e) if d == "LONG" else (e - t)
+                return round(rew / risk, 2) if risk > 0 else 0.0
+            except: return 0.0
+        rr1 = _rr(entry, stop, t1, dirn)
+        rr2 = _rr(entry, stop, t2, dirn)
+        return {
+            "ticker": trade.get("Ticker"),
+            "entry": entry,
+            "stop": stop,
+            "t1": t1,
+            "t2": t2,
+            "direction": dirn,
+            "confidence": trade.get("Confidence", "N/A"),
+            "atr": trade.get("ATR", "$0").replace("$", ""),
+            "scenario": trade.get("Scenario", ""),
+            "rr_t1": rr1,
+            "rr_t2": rr2,
+            "best_rr": max(rr1, rr2),
+            "tracking_start_time": get_cst_now().isoformat(),
+        }
+
+    def _is_already_tracked(ticker):
+        return any(t["ticker"] == ticker for t in st.session_state["tracking_trades"])
+    
+    def _is_near_entry_price(trade, threshold_pct=0.5):
+        """Check if trade open is within threshold% of entry price."""
+        try:
+            # For gap scenarios, try to extract entry from Notes first
+            notes = trade.get("Notes", "")
+            entry = None
+            
+            if notes and isinstance(notes, str) and "Gap" in notes:
+                # Extract price from gap notes
+                import re
+                if "near" in notes.lower():
+                    parts = notes.lower().split("near")
+                    if len(parts) > 1:
+                        prices = re.findall(r'\$?([\d.]+)', parts[-1])
+                        if prices:
+                            try:
+                                entry = float(prices[0])
+                            except:
+                                pass
+                
+                # Fallback: extract last price mentioned
+                if entry is None:
+                    prices = re.findall(r'\$?([\d.]+)', notes)
+                    if prices:
+                        try:
+                            entry = float(prices[-1])
+                        except:
+                            pass
+            
+            # If still no entry, try Entry field
+            if entry is None:
+                entry = float(str(trade.get("Entry", "$0")).replace("$", ""))
+            
+            open_price = float(str(trade.get("Open", "$0")).replace("$", ""))
+            direction = trade.get("Direction", "LONG")
+            gap_thr = round(entry * threshold_pct / 100, 2)
+            
+            if direction == "LONG":
+                return (entry - gap_thr) <= open_price <= (entry + gap_thr)
+            else:  # SHORT
+                return (entry - gap_thr) <= open_price <= (entry + gap_thr)
+        except:
+            return False
+
+    # ── AUTO-START: auto-track OPENS NEAR ENTRY at 8:30 AM CST+ (skip DIVERGED) ──
+    if auto_track_enabled and near_entry_rows and not st.session_state["tracking_trades"]:
+        for trade in near_entry_rows:
+            if not _is_already_tracked(trade.get("Ticker")):
+                # Check 8:30 bias — skip if DIVERGED
+                _chk = get_830_bias_eval(trade.get("Ticker"), trade.get("Direction"))
+                if _chk and _chk.get("alignment") == "DIVERGED":
+                    continue
+                # Auto-save to database
+                try:
+                    entry_val = float(str(trade.get("Open", "$0")).replace("$", ""))
+                    stop_val = float(str(trade.get("Stop", "$0")).replace("$", ""))
+                    t1_val = float(str(trade.get("T1", "$0")).replace("$", ""))
+                    t2_val = float(str(trade.get("T2", "$0")).replace("$", ""))
+                    save_trade(
+                        ticker=trade.get("Ticker"),
+                        direction=trade.get("Direction"),
+                        entry_price=entry_val,
+                        stop_loss=stop_val,
+                        target1=t1_val,
+                        target2=t2_val,
+                        open_price=entry_val,
+                        notes=f"Auto-tracked at 8:30 AM (Confidence: {trade.get('Confidence', 'N/A')})"
+                    )
+                except Exception as e:
+                    print(f"⚠️ Auto-save failed for {trade.get('Ticker')}: {e}")
+                st.session_state["tracking_trades"].append(_make_track_entry(trade))
+    
+    # ── AUTO-TRACK: Gap/PastStop if they're actually near entry price ──
+    if auto_track_enabled and secondary_tracking_candidates and not st.session_state["tracking_trades"]:
+        for trade in secondary_tracking_candidates:
+            if not _is_already_tracked(trade.get("Ticker")) and _is_near_entry_price(trade):
+                # Check 8:30 bias — skip if DIVERGED
+                _chk = get_830_bias_eval(trade.get("Ticker"), trade.get("Direction"))
+                if _chk and _chk.get("alignment") == "DIVERGED":
+                    continue
+                # Auto-save to database
+                try:
+                    entry_val = float(str(trade.get("Open", "$0")).replace("$", ""))
+                    stop_val = float(str(trade.get("Stop", "$0")).replace("$", ""))
+                    t1_val = float(str(trade.get("T1", "$0")).replace("$", ""))
+                    t2_val = float(str(trade.get("T2", "$0")).replace("$", ""))
+                    save_trade(
+                        ticker=trade.get("Ticker"),
+                        direction=trade.get("Direction"),
+                        entry_price=entry_val,
+                        stop_loss=stop_val,
+                        target1=t1_val,
+                        target2=t2_val,
+                        open_price=entry_val,
+                        notes=f"Auto-tracked at 8:30 AM from {trade.get('Scenario', 'unknown')} (Confidence: {trade.get('Confidence', 'N/A')})"
+                    )
+                except Exception as e:
+                    print(f"⚠️ Auto-save failed for {trade.get('Ticker')}: {e}")
+                st.session_state["tracking_trades"].append(_make_track_entry(trade))
+
+    # ── Helper: render a scenario table with Track buttons on each row ──
+    def _render_trackable_table(rows, title, table_key, display_cols):
+        """Display a scenario table with a Track button per row."""
+        st.markdown(f"### {title}")
+        if not rows:
+            st.dataframe(pd.DataFrame(columns=display_cols), use_container_width=True, height=78)
+            return
+        # Sort by Best RR (highest first)
+        def _parse_rr(val):
+            try: return float(str(val).replace("x",""))
+            except: return 0
+        rows_sorted = sorted(rows, key=lambda x: _parse_rr(x.get("Best RR", "0")), reverse=True)
+        df = pd.DataFrame(rows_sorted)
+        # Only use columns that actually exist in the DataFrame
+        cols_to_show = [c for c in display_cols if c in df.columns]
+        df_display = df[cols_to_show] if cols_to_show else df
+        if "_best_rr_sort_main" in df_display.columns:
+            df_display = df_display.drop(columns=["_best_rr_sort_main"])
+        st.dataframe(df_display, use_container_width=True, height=min(40 * max(len(df_display), 1) + 38, 400))
+        # Track buttons row underneath the table
+        btn_cols = st.columns(min(len(rows), 8))
+        for idx, trade in enumerate(rows[:8]):
+            tkr = trade.get("Ticker", "?")
+            already = _is_already_tracked(tkr)
+            label = f"🎯 {tkr}" if already else f"📌 {tkr}"
+            with btn_cols[idx % len(btn_cols)]:
+                if st.button(label, key=f"trk_{table_key}_{idx}_{tkr}", use_container_width=True, disabled=already):
+                    # Auto-save to database
+                    try:
+                        entry_val = float(str(trade.get("Open", "$0")).replace("$", ""))
+                        stop_val = float(str(trade.get("Stop", "$0")).replace("$", ""))
+                        t1_val = float(str(trade.get("T1", "$0")).replace("$", ""))
+                        t2_val = float(str(trade.get("T2", "$0")).replace("$", ""))
+                        saved, telegram_sent = save_trade(
+                            ticker=trade.get("Ticker"),
+                            direction=trade.get("Direction"),
+                            entry_price=entry_val,
+                            stop_loss=stop_val,
+                            target1=t1_val,
+                            target2=t2_val,
+                            open_price=entry_val,
+                            notes=f"Tracked from Intraday Plan (Confidence: {trade.get('Confidence', 'N/A')})"
+                        )
+                        if saved:
+                            st.success(f"✅ {tkr} saved to Trade Tracker")
+                            if telegram_sent:
+                                st.caption("📱 Telegram notification sent")
+                    except Exception as e:
+                        st.error(f"Failed to save {tkr}: {e}")
+                    st.session_state["tracking_trades"].append(_make_track_entry(trade))
+                    st.rerun()
+
+    # ── SCENARIO TABLES with per-row Track buttons ──
+    between_rows = [r for r in table_rows if r.get("Scenario", "").strip().startswith("⚡ OPENS BETWEEN ENTRY & STOP")]
+    scenario_other_rows = [r for r in table_rows if not (r.get("Scenario", "").strip().startswith("✅ OPENS NEAR ENTRY") or r.get("Scenario", "").strip().startswith("⚡ OPENS BETWEEN ENTRY & STOP"))]
+    between_rows.sort(key=lambda x: conf_priority.get(x.get("Confidence", "LOW"), 999))
+    scenario_other_rows.sort(key=lambda x: conf_priority.get(x.get("Confidence", "LOW"), 999))
+    
+    # Only define display_cols if table_rows is not empty
+    if table_rows:
+        # Explicit column order — focused set, noisy columns excluded
+        preferred_order = [
+            "Ticker", "Direction", "Option", "Scenario", "Notes",
+            "Open", "Prev Close", "Stop", "T1", "T2",
+            "RR(T1)", "RR(T2)", "Best RR",
+            "ATM", "Spread", "ATR", "Confidence",
+            "Exp 0DTE", "Exp 2-3DTE", "Current", "Move",
+        ]
+        all_keys = [c for c in table_rows[0].keys() if c not in ["_scenario_id", "_best_rr_sort_main"]]
+        display_cols = [c for c in preferred_order if c in all_keys]
+    else:
+        display_cols = []
+
+    # ── Initialize bias target (will be updated later if needed) ─────────────
+    _bias_target = None
+
+    # ── Enrich scenario rows with 10m/30m/4H bias ──────────────────────────
+    def _enrich_rows_with_bias(rows):
+        """Add 10m, 30m, 4H bias + Alignment to each row."""
+        enriched = []
+        for r in rows:
+            ticker = r.get("Ticker", "?")
+            direction = r.get("Direction", "LONG")
+            bias_info = get_830_bias_eval(ticker, direction, target_date=_bias_target)
+            r_enr = r.copy()
+            r_enr["10m Bias"] = bias_info.get("bias_10m", "N/A") if bias_info else "N/A"
+            r_enr["30m Bias"] = bias_info.get("bias_30m", "N/A") if bias_info else "N/A"
+            r_enr["4H Bias"]  = bias_info.get("bias_4h", "N/A") if bias_info else "N/A"
+            r_enr["Alignment"] = bias_info.get("alignment", "N/A") if bias_info else "N/A"
+            
+            # ── ADJUST DIRECTION FOR BIG GAP SCENARIOS BASED ON BIAS ──
+            # If scenario is BIG GAP DOWN/UP, check if bias strongly disagrees with direction
+            scenario_text = r.get("Scenario", "").upper() if r.get("Scenario") else ""
+            if "BIG GAP" in scenario_text:
+                # Count bias signals
+                bias_10m = r_enr.get("10m Bias", "").upper()
+                bias_30m = r_enr.get("30m Bias", "").upper()
+                bias_4h = r_enr.get("4H Bias", "").upper()
+                
+                bearish_count = sum(1 for b in [bias_10m, bias_30m, bias_4h] if "BEARISH" in b)
+                bullish_count = sum(1 for b in [bias_10m, bias_30m, bias_4h] if "BULLISH" in b)
+                
+                # For BIG GAP DOWN: if 2+ biases are BEARISH, flip to SHORT
+                if "GAP DOWN" in scenario_text and bearish_count >= 2 and direction == "LONG":
+                    r_enr["Direction"] = "SHORT"  # Flip to SHORT due to strong bearish bias
+                    # Re-evaluate bias_info with new direction
+                    new_bias_info = get_830_bias_eval(ticker, "SHORT", target_date=_bias_target)
+                    if new_bias_info:
+                        r_enr["Alignment"] = new_bias_info.get("alignment", "N/A")
+                
+                # For BIG GAP UP: if 2+ biases are BULLISH, flip to LONG
+                elif "GAP UP" in scenario_text and bullish_count >= 2 and direction == "SHORT":
+                    r_enr["Direction"] = "LONG"  # Flip to LONG due to strong bullish bias
+                    # Re-evaluate bias_info with new direction
+                    new_bias_info = get_830_bias_eval(ticker, "LONG", target_date=_bias_target)
+                    if new_bias_info:
+                        r_enr["Alignment"] = new_bias_info.get("alignment", "N/A")
+            
+            enriched.append(r_enr)
+        return enriched
+    
+    # Note: Enriched rows will be created fresh inside the fragment for correct _bias_target
+    # (after _bias_target is updated based on plan_date)
+
+    # Add bias columns to display list
+    for _bias_col in ["10m Bias", "30m Bias", "4H Bias", "Alignment"]:
+        if _bias_col not in display_cols:
+            display_cols.append(_bias_col)
+
+    # ── AUTO-REFRESH INTRADAY SCENARIO TABLES (every 5 min) ──────────────────
+    @st.fragment(run_every=timedelta(minutes=5))
+    def _refresh_scenario_tables():
+        """Auto-refresh scenario tables every 5 min with 10m/30m/4H bias columns."""
+        _now = get_cst_now()
+        st.caption(f"🔄 Auto-refreshes every 5 min · Last refresh: {_now.strftime('%I:%M:%S %p CST')}")
+        
+        # Color helper for bias/alignment
+        def _color_bias(val):
+            if not isinstance(val, str): return ""
+            v = val.upper()
+            if "BULLISH" in v: return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+            if "BEARISH" in v: return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+            if "CONFIRMED" in v: return "color: #00e5a0; font-weight: 700"
+            if "DIVERGED" in v: return "color: #f0c040; font-weight: 700"
+            return ""
+        
+        # Re-enrich on each refresh for fresh bias data
+        _near_fresh = _enrich_rows_with_bias(near_entry_rows)
+        _btwn_fresh = _enrich_rows_with_bias(between_rows)
+        bias_style_cols = ["10m Bias", "30m Bias", "4H Bias", "Alignment"]
+        
+        # ── OPENS NEAR ENTRY ────
+        if _near_fresh:
+            st.markdown("### ✅ OPENS NEAR ENTRY")
+            df_near = pd.DataFrame(_near_fresh)
+            cols_to_show = [c for c in display_cols if c in df_near.columns]
+            styled_near = df_near[cols_to_show].style.applymap(_color_bias, subset=[c for c in bias_style_cols if c in cols_to_show])
+            st.dataframe(styled_near, use_container_width=True, height=min(40 * len(df_near) + 38, 400))
+            
+            # Track buttons
+            btn_cols = st.columns(min(len(_near_fresh), 8))
+            for idx, trade in enumerate(_near_fresh[:8]):
+                tkr = trade.get("Ticker", "?")
+                already = _is_already_tracked(tkr)
+                label = f"🎯 {tkr}" if already else f"📌 {tkr}"
+                with btn_cols[idx % len(btn_cols)]:
+                    if st.button(label, key=f"trk_near_{idx}_{tkr}", use_container_width=True, disabled=already):
+                        try:
+                            entry_val = float(str(trade.get("Open", "$0")).replace("$", ""))
+                            stop_val = float(str(trade.get("Stop", "$0")).replace("$", ""))
+                            t1_val = float(str(trade.get("T1", "$0")).replace("$", ""))
+                            t2_val = float(str(trade.get("T2", "$0")).replace("$", ""))
+                            saved, _ = save_trade(
+                                ticker=trade.get("Ticker"),
+                                direction=trade.get("Direction"),
+                                entry_price=entry_val,
+                                stop_loss=stop_val,
+                                target1=t1_val,
+                                target2=t2_val,
+                                open_price=entry_val,
+                                notes=f"Tracked from Intraday Plan (Confidence: {trade.get('Confidence', 'N/A')})"
+                            )
+                            if saved:
+                                st.success(f"✅ {tkr} saved to Trade Tracker")
+                        except Exception as e:
+                            st.error(f"Failed to save {tkr}: {e}")
+                        st.session_state["tracking_trades"].append(_make_track_entry(trade))
+                        st.rerun()
+        
+        # ── OPENS BETWEEN ENTRY & STOP ────
+        if _btwn_fresh:
+            st.markdown("### ⚡ OPENS BETWEEN ENTRY & STOP")
+            df_btwn = pd.DataFrame(_btwn_fresh)
+            cols_to_show = [c for c in display_cols if c in df_btwn.columns]
+            styled_btwn = df_btwn[cols_to_show].style.applymap(_color_bias, subset=[c for c in bias_style_cols if c in cols_to_show])
+            st.dataframe(styled_btwn, use_container_width=True, height=min(40 * len(df_btwn) + 38, 400))
+            
+            # Track buttons
+            btn_cols = st.columns(min(len(_btwn_fresh), 8))
+            for idx, trade in enumerate(_btwn_fresh[:8]):
+                tkr = trade.get("Ticker", "?")
+                already = _is_already_tracked(tkr)
+                label = f"🎯 {tkr}" if already else f"📌 {tkr}"
+                with btn_cols[idx % len(btn_cols)]:
+                    if st.button(label, key=f"trk_btwn_{idx}_{tkr}", use_container_width=True, disabled=already):
+                        try:
+                            entry_val = float(str(trade.get("Open", "$0")).replace("$", ""))
+                            stop_val = float(str(trade.get("Stop", "$0")).replace("$", ""))
+                            t1_val = float(str(trade.get("T1", "$0")).replace("$", ""))
+                            t2_val = float(str(trade.get("T2", "$0")).replace("$", ""))
+                            saved, _ = save_trade(
+                                ticker=trade.get("Ticker"),
+                                direction=trade.get("Direction"),
+                                entry_price=entry_val,
+                                stop_loss=stop_val,
+                                target1=t1_val,
+                                target2=t2_val,
+                                open_price=entry_val,
+                                notes=f"Tracked from Intraday Plan (Confidence: {trade.get('Confidence', 'N/A')})"
+                            )
+                            if saved:
+                                st.success(f"✅ {tkr} saved to Trade Tracker")
+                        except Exception as e:
+                            st.error(f"Failed to save {tkr}: {e}")
+                        st.session_state["tracking_trades"].append(_make_track_entry(trade))
+                        st.rerun()
+
+    if display_cols and (near_entry_rows or between_rows):
+        pass  # Moved to render after POSITION TRACKER (see below)
+
+    # ── POSITION TRACKER —FIRST TABLE ──────────
+    tracked = st.session_state.get("tracking_trades", [])
+    if tracked:
+        st.markdown("---")
+        _replay_clock(8 * 60 + 30, "Auto-tracking confirmed trades at market open")
+        st.markdown(f"### 📍 Tracking {len(tracked)} Position(s)")
+
+        # Clear All button
+        if st.button("❌ Clear All Tracking", key="clear_all_tracking"):
+            st.session_state["tracking_trades"] = []
+            st.rerun()
+
+        @st.fragment(run_every=timedelta(minutes=5))
+        def _live_tracker_fragment():
+            """Auto-refreshes every 5 min — only this fragment, not the whole page."""
+            _tracked = st.session_state.get("tracking_trades", [])
+            if not _tracked:
+                return
+            _now = get_cst_now()
+            _rp_mode = st.session_state.get("replay_mode", False)
+            _rp_dt = st.session_state.get("replay_date")
+            _rp_time_min = st.session_state.get("replay_time_min", 500)
+            if _rp_mode and _rp_dt:
+                _rp_h, _rp_m = divmod(_rp_time_min, 60)
+                st.caption(f"🔄 Replay prices for **{_rp_dt.strftime('%m/%d/%Y')}** at **{_rp_h if _rp_h <= 12 else _rp_h-12}:{_rp_m:02d} {'AM' if _rp_h < 12 else 'PM'} CST**")
+            else:
+                st.caption(f"🔄 Live prices · Last refresh: {_now.strftime('%I:%M:%S %p CST')} · Auto-refreshes every 5 min")
+
+            import yfinance as yf
+            track_rows = []
+            error_tickers = []
+            for ti, tr in enumerate(_tracked):
+                try:
+                    tk = yf.Ticker(tr['ticker'])
+                    # In replay mode, fetch intraday bars and pick price at simulated time
+                    if _rp_mode and _rp_dt:
+                        _intra = tk.history(start=str(_rp_dt), end=str(_rp_dt + timedelta(days=1)), interval="5m", prepost=True)
+                        if _intra.empty:
+                            # Fallback to daily
+                            hist = tk.history(start=str(_rp_dt), end=str(_rp_dt + timedelta(days=1)))
+                            live_price = float(hist["Close"].iloc[-1]) if not hist.empty else None
+                        else:
+                            # Convert replay time to ET for matching (CST+1)
+                            _et_tz = pytz.timezone("America/New_York")
+                            _cst_tz = pytz.timezone("America/Chicago")
+                            _sim_cst = _cst_tz.localize(datetime(_rp_dt.year, _rp_dt.month, _rp_dt.day, _rp_h, _rp_m, 0))
+                            _sim_et = _sim_cst.astimezone(_et_tz)
+                            # Filter bars up to simulated time
+                            _idx = _intra.index
+                            if _idx.tz is None:
+                                _idx = _idx.tz_localize("America/New_York")
+                            else:
+                                _idx = _idx.tz_convert("America/New_York")
+                            _bars_before = _intra[_idx <= _sim_et]
+                            if not _bars_before.empty:
+                                live_price = float(_bars_before["Close"].iloc[-1])
+                            else:
+                                # Before any intraday bar — use open of first bar
+                                live_price = float(_intra["Open"].iloc[0])
+                        if live_price is None:
+                            error_tickers.append(tr['ticker'])
+                            continue
+                    else:
+                        hist = tk.history(period="5d")
+                        if hist.empty:
+                            error_tickers.append(tr['ticker'])
+                            continue
+                        live_price = float(hist["Close"].iloc[-1])
+                    entry = tr['entry']
+                    stop = tr['stop']
+                    t1 = tr['t1']
+                    t2 = tr['t2']
+                    direction = tr['direction']
+
+                    if direction == "LONG":
+                        pnl_pct = (live_price - entry) / entry * 100
+                        passed_stop = live_price <= stop
+                        passed_t1 = live_price >= t1
+                        passed_t2 = live_price >= t2
+                    else:
+                        pnl_pct = (entry - live_price) / entry * 100
+                        passed_stop = live_price >= stop
+                        passed_t1 = live_price <= t1
+                        passed_t2 = live_price <= t2
+
+                    # Multi-timeframe bias (10m / 30m / 4H)
+                    _bias_td = _rp_dt if (_rp_mode and _rp_dt) else None
+                    bias_830 = get_830_bias_eval(tr['ticker'], direction, target_date=_bias_td)
+                    bias_10m = bias_830.get("bias_10m", "N/A") if bias_830 else "N/A"
+                    bias_30m = bias_830.get("bias_30m", "N/A") if bias_830 else "N/A"
+                    bias_4h  = bias_830.get("bias_4h",  "N/A") if bias_830 else "N/A"
+                    alignment = bias_830.get("alignment", "N/A") if bias_830 else "N/A"
+                    align_icon = "✅" if alignment == "CONFIRMED" else ("⚠️" if alignment == "DIVERGED" else "")
+
+                    # ── Flip direction if bias contradicts tracked trade ──
+                    disp_direction = direction
+                    disp_stop = stop
+                    disp_t1 = t1
+                    disp_t2 = t2
+                    flipped = False
+                    opn_830 = bias_830.get("today_open") if bias_830 else None
+
+                    if alignment == "CONFIRMED" and opn_830 is not None:
+                        bias_dir = None
+                        if bias_10m == "BULLISH" and bias_30m == "BULLISH" and bias_4h == "BULLISH":
+                            bias_dir = "LONG"
+                        elif bias_10m == "BEARISH" and bias_30m == "BEARISH" and bias_4h == "BEARISH":
+                            bias_dir = "SHORT"
+                        if bias_dir and bias_dir != direction:
+                            flipped = True
+                            disp_direction = bias_dir
+                            disp_stop = round(2 * opn_830 - stop, 2)
+                            disp_t1   = round(2 * opn_830 - t1, 2)
+                            disp_t2   = round(2 * opn_830 - t2, 2)
+                            # Recalc P&L with flipped direction
+                            if disp_direction == "LONG":
+                                pnl_pct = (live_price - entry) / entry * 100
+                                passed_stop = live_price <= disp_stop
+                                passed_t1 = live_price >= disp_t1
+                                passed_t2 = live_price >= disp_t2
+                            else:
+                                pnl_pct = (entry - live_price) / entry * 100
+                                passed_stop = live_price >= disp_stop
+                                passed_t1 = live_price <= disp_t1
+                                passed_t2 = live_price <= disp_t2
+
+                    # Suggested action (uses 10m + 4H for decision)
+                    if passed_stop:
+                        action = "🔴 EXIT — Stop Hit"
+                    elif passed_t2:
+                        action = "🏆 FULL PROFIT — T2"
+                    elif passed_t1:
+                        action = "🎉 SCALE OUT — T1"
+                    elif alignment == "CONFIRMED":
+                        action = "✅ HOLD — Confirmed"
+                    elif bias_10m != "N/A" and bias_4h != "N/A" and bias_10m != bias_4h:
+                        action = "⚠️ CAUTION — 10m vs 4H diverged"
+                    elif alignment == "DIVERGED":
+                        action = "⚠️ CAUTION — Diverged"
+                    elif pnl_pct >= 2.0:
+                        action = "📈 TRAIL STOP"
+                    else:
+                        action = "⏳ MONITOR"
+
+                    # Shorten bias labels
+                    _short = lambda b: "BULL" if b == "BULLISH" else ("BEAR" if b == "BEARISH" else b)
+                    # Shorten scenario
+                    _scn = tr.get("scenario", "")
+                    if "OPENS NEAR ENTRY" in _scn.upper():
+                        _scn_short = "ONE"
+                    elif "OPENS BETWEEN" in _scn.upper():
+                        _scn_short = "OBE"
+                    elif "OPENS PAST STOP" in _scn.upper():
+                        _scn_short = "OPS"
+                    elif "GAP" in _scn.upper():
+                        _scn_short = "GAP"
+                    else:
+                        _scn_short = _scn[:10]
+
+                    # RR from live values
+                    def _live_rr(e, s, t, d):
+                        try:
+                            risk = (e - s) if d == "LONG" else (s - e)
+                            rew  = (t - e) if d == "LONG" else (e - t)
+                            return round(rew / risk, 2) if risk > 0 else 0.0
+                        except: return 0.0
+                    _ds = disp_stop if isinstance(disp_stop, (int, float)) else stop
+                    _dt1 = disp_t1  if isinstance(disp_t1,  (int, float)) else t1
+                    _dt2 = disp_t2  if isinstance(disp_t2,  (int, float)) else t2
+                    rr_t1    = _live_rr(entry, _ds, _dt1, disp_direction)
+                    rr_t2    = _live_rr(entry, _ds, _dt2, disp_direction)
+                    best_rr  = max(rr_t1, rr_t2)
+                    if best_rr == 0:
+                        rr_t1   = tr.get("rr_t1", 0)
+                        rr_t2   = tr.get("rr_t2", 0)
+                        best_rr = tr.get("best_rr", 0)
+
+                    track_rows.append({
+                        "Ticker":     tr['ticker'],
+                        "Dir":        f"{'🔄 ' if flipped else ''}{disp_direction}",
+                        "Action":     action,
+                        "Scen":       _scn_short,
+                        "Live $":     f"${live_price:.2f}",
+                        "Entry":      f"${entry:.2f}",
+                        "P&L":        f"{pnl_pct:+.2f}%",
+                        "Stop":       f"${_ds:.2f}",
+                        "T1":         f"${_dt1:.2f}",
+                        "T2":         f"${_dt2:.2f}",
+                        "RR(T1)":     f"{rr_t1:.2f}x",
+                        "RR(T2)":     f"{rr_t2:.2f}x",
+                        "Best RR":    f"{best_rr:.2f}x",
+                        "Conf":       tr.get('confidence', 'N/A'),
+                        "10m":        _short(bias_10m),
+                        "30m":        _short(bias_30m),
+                        "4H":         _short(bias_4h),
+                        "Align":      f"{align_icon} {alignment}",
+                        "_best_rr_sort": best_rr,
+                    })
+                except Exception:
+                    error_tickers.append(tr['ticker'])
+
+            if track_rows:
+                # Sort by Best RR (highest first)
+                track_rows_sorted = sorted(track_rows, key=lambda x: x.get("_best_rr_sort", 0), reverse=True)
+                _fixed_cols = ["Ticker", "Dir", "Action", "Scen", "Live $", "Entry",
+                               "P&L", "Stop", "T1", "T2", "RR(T1)", "RR(T2)", "Best RR",
+                               "Conf", "10m", "30m", "4H", "Align"]
+                track_df = pd.DataFrame(track_rows_sorted)
+                if "_best_rr_sort" in track_df.columns:
+                    track_df = track_df.drop(columns=["_best_rr_sort"])
+                track_df = track_df[[c for c in _fixed_cols if c in track_df.columns]]
+                # Color bias columns
+                def _color_trk_bias(val):
+                    if not isinstance(val, str): return ""
+                    v = val.upper()
+                    if "BULL" in v: return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+                    if "BEAR" in v: return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+                    if "CONFIRMED" in v: return "color: #00e5a0; font-weight: 700"
+                    if "DIVERGED" in v: return "color: #f0c040; font-weight: 700"
+                    return ""
+                _trk_bias_cols = [c for c in ["10m", "30m", "4H", "Align"] if c in track_df.columns]
+                styled_trk = track_df.style.applymap(_color_trk_bias, subset=_trk_bias_cols) if _trk_bias_cols else track_df
+                _trk_col_config = {
+                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                    "Dir":    st.column_config.TextColumn("Dir",    width="small"),
+                    "Action": st.column_config.TextColumn("Action", width="medium"),
+                    "Scen":   st.column_config.TextColumn("Scen",   width="small"),
+                    "Live $": st.column_config.TextColumn("Live $", width="small"),
+                    "P&L":    st.column_config.TextColumn("P&L",    width="small"),
+                    "RR(T1)": st.column_config.TextColumn("RR(T1)", width="small"),
+                    "RR(T2)": st.column_config.TextColumn("RR(T2)", width="small"),
+                    "Best RR":st.column_config.TextColumn("Best RR",width="small"),
+                    "Conf":   st.column_config.TextColumn("Conf",   width="small"),
+                    "10m":    st.column_config.TextColumn("10m",    width="small"),
+                    "30m":    st.column_config.TextColumn("30m",    width="small"),
+                    "4H":     st.column_config.TextColumn("4H",     width="small"),
+                    "Align":  st.column_config.TextColumn("Align",  width="small"),
+                }
+                st.dataframe(styled_trk, use_container_width=True,
+                             column_config=_trk_col_config,
+                             height=min(40 * max(len(track_df), 1) + 38, 400))
+
+            if error_tickers:
+                st.caption(f"⚠️ Could not fetch data for: {', '.join(error_tickers)}")
+
+        _live_tracker_fragment()
+
+        # Per-row delete buttons (outside fragment so they don't auto-refresh)
+        st.markdown("**Quick Actions:**")
+        del_cols = st.columns(min(len(tracked), 8))
+        for di, tr in enumerate(tracked[:8]):
+            with del_cols[di % len(del_cols)]:
+                if st.button(f"🗑️ {tr['ticker']}", key=f"del_trk_{di}_{tr['ticker']}", use_container_width=True):
+                    st.session_state["tracking_trades"].pop(di)
+                    st.rerun()
+
+    # ── SCENARIO TABLES WITH BIAS (renders after Tracking) ──────────────────
+    st.markdown("---")
+    if display_cols and (near_entry_rows or between_rows):
+        _refresh_scenario_tables()
+
+    # ── CHECK OPEN PRICES TABLES (after tracking & scenarios) ──
+    st.markdown("### ☀️ CHECK OPEN PRICES")
+    st.info("See tables above — they auto-refresh every 5 minutes with live prices.")
+
+    # ── ENTRY CONFIRMATION TABLE (after 9 AM CST) ────────────────
+    # ── Bias date: plan_date + 1 (if plan_date is today, bias_date = today) ──
+    st.markdown("---")
+    from datetime import date as _date_type
+    if _in_replay and st.session_state.get("replay_date"):
+        bias_date = st.session_state["replay_date"]
+    elif plan_date == _date_type.today():
+        bias_date = _date_type.today()
+    else:
+        bias_date = plan_date + timedelta(days=1)
+    if bias_date != _date_type.today():
+        _bias_label = "replay date" if _in_replay else "plan date + 1"
+        st.info(f"📆 Bias date: **{bias_date.strftime('%A, %B %d, %Y')}** ({_bias_label})")
+    # Convert to target_date param: None = live, date = backtest
+    _bias_target = bias_date if bias_date != _date_type.today() else None
+    # Override time gates when backtesting a past date
+    if _bias_target is not None:
+        early_confirmation_enabled = True
+        entry_confirmation_enabled = True
+
+    # When backtesting a past date or replaying, also include tracked trades as candidates
+    _confirmation_candidates = list(near_entry_rows) if near_entry_rows else []
+    if _bias_target is not None:
+        tracked_as_rows = []
+        for tr in st.session_state.get("tracking_trades", []):
+            tkr = tr.get("ticker", "?")
+            # Avoid duplicates with near_entry_rows
+            if any(r.get("Ticker") == tkr for r in _confirmation_candidates):
+                continue
+            _rr1_tr = tr.get("rr_t1", 0)
+            _rr2_tr = tr.get("rr_t2", 0)
+            _best_rr_tr = tr.get("best_rr", max(_rr1_tr, _rr2_tr))
+            tracked_as_rows.append({
+                "Ticker": tkr,
+                "Direction": tr.get("direction", "LONG"),
+                "Option": "CALL" if tr.get("direction") == "LONG" else "PUT",
+                "Open": f"${tr.get('entry', 0):.2f}" if isinstance(tr.get('entry'), (int, float)) else tr.get('entry', ''),
+                "Stop": f"${tr.get('stop', 0):.2f}" if isinstance(tr.get('stop'), (int, float)) else tr.get('stop', ''),
+                "T1": f"${tr.get('t1', 0):.2f}" if isinstance(tr.get('t1'), (int, float)) else tr.get('t1', ''),
+                "T2": f"${tr.get('t2', 0):.2f}" if isinstance(tr.get('t2'), (int, float)) else tr.get('t2', ''),
+                "RR(T1)": f"{_rr1_tr:.2f}x",
+                "RR(T2)": f"{_rr2_tr:.2f}x",
+                "Best RR": f"{_best_rr_tr:.2f}x",
+                "Confidence": tr.get("confidence", "N/A"),
+                "ATR": f"${tr.get('atr', '')}" if tr.get('atr') else "",
+                "Scenario": tr.get("scenario", ""),
+                "_best_rr_sort_main": _best_rr_tr,
+            })
+        _confirmation_candidates.extend(tracked_as_rows)
+        if not _confirmation_candidates:
+            st.warning("📋 No trades to evaluate. Run the scanner first or add trades to tracking.")
+
+    # ── SECONDARY TRACKING CANDIDATES: Big Gap scenarios (display at 8:30 AM) ──
+    if secondary_tracking_candidates:
+        st.markdown("---")
+        st.markdown("### ⚠️ BIG GAP SCENARIOS AT 8:30 AM")
+        st.markdown("**Gap Up/Down scenarios** — Entry (from plan notes) | Live Price | 10m/30m/4H Bias · Auto-track only if near entry price")
+        
+        @st.fragment(run_every=timedelta(seconds=60))
+        def _gap_scenarios_fragment():
+            """Auto-refresh gap scenarios every 1 min with live prices & bias."""
+            _now = get_cst_now()
+            st.caption(f"🔄 Auto-refreshes every 1 min · Last refresh: {_now.strftime('%I:%M:%S %p CST')}")
+            
+            sec_enriched = _enrich_rows_with_bias(secondary_tracking_candidates)
+            
+            if sec_enriched:
+                # Build gap scenario table with: Ticker, Entry (from notes), Current Price, Direction, Stop, T1, T2, 10m Bias, 30m Bias, 4H Bias, Alignment, Notes
+                gap_rows_display = []
+                for trade in sec_enriched:
+                    try:
+                        # Extract entry price from Notes field
+                        # Format: "Gap down >$1.86 below $372.04 — wait for bounce near $370.00"
+                        notes = trade.get("Notes", "")
+                        entry_price = None
+                        
+                        if notes and isinstance(notes, str):
+                            # Try to extract price after "near" keyword
+                            if "near" in notes.lower():
+                                parts = notes.lower().split("near")
+                                if len(parts) > 1:
+                                    # Extract numbers from the part after "near"
+                                    import re
+                                    prices = re.findall(r'\$?([\d.]+)', parts[-1])
+                                    if prices:
+                                        try:
+                                            entry_price = float(prices[0])
+                                        except:
+                                            pass
+                            
+                            # Fallback: extract last price mentioned in notes
+                            if entry_price is None:
+                                import re
+                                prices = re.findall(r'\$?([\d.]+)', notes)
+                                if prices:
+                                    try:
+                                        entry_price = float(prices[-1])
+                                    except:
+                                        pass
+                        
+                        # If still no entry, use Open price
+                        if entry_price is None:
+                            entry_price = float(str(trade.get("Open", "$0")).replace("$", ""))
+                        
+                        open_price = float(str(trade.get("Open", "$0")).replace("$", ""))
+                        ticker = trade.get("Ticker", "?")
+                        
+                        gap_rows_display.append({
+                            "Ticker": ticker,
+                            "Entry": f"${entry_price:.2f}",  # Gap entry from notes
+                            "Current Price": f"${open_price:.2f}",  # Will update live
+                            "Direction": trade.get("Direction", "?"),
+                            "Stop": trade.get("Stop", "?"),
+                            "T1": trade.get("T1", "?"),
+                            "T2": trade.get("T2", "?"),
+                            "10m Bias": trade.get("10m Bias", "N/A"),
+                            "30m Bias": trade.get("30m Bias", "N/A"),
+                            "4H Bias": trade.get("4H Bias", "N/A"),
+                            "Alignment": trade.get("Alignment", "N/A"),
+                            "Notes": notes,
+                        })
+                    except:
+                        pass
+                
+                if gap_rows_display:
+                    df_gap = pd.DataFrame(gap_rows_display)
+                    
+                    # Reorder columns: Ticker, Entry, Current Price, Direction, Stop, T1, T2, 10m Bias, 30m Bias, 4H Bias, Alignment, Notes
+                    cols_order = ["Ticker", "Entry", "Current Price", "Direction", "Stop", "T1", "T2", "10m Bias", "30m Bias", "4H Bias", "Alignment", "Notes"]
+                    cols_to_show = [c for c in cols_order if c in df_gap.columns]
+                    df_gap_display = df_gap[cols_to_show]
+                    
+                    # Color styling for bias columns
+                    def _color_gap_bias(val):
+                        if not isinstance(val, str): return ""
+                        v = val.upper()
+                        if "BULLISH" in v: return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+                        if "BEARISH" in v: return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+                        if "CONFIRMED" in v: return "color: #00e5a0; font-weight: 700"
+                        if "DIVERGED" in v: return "color: #f0c040; font-weight: 700"
+                        return ""
+                    
+                    bias_cols = ["10m Bias", "30m Bias", "4H Bias", "Alignment"]
+                    styled_gap = df_gap_display.style.applymap(_color_gap_bias, subset=[c for c in bias_cols if c in df_gap_display.columns])
+                    st.dataframe(styled_gap, use_container_width=True, height=min(40 * max(len(df_gap_display), 1) + 38, 400))
+        
+        # ── CALL THE FRAGMENT TO DISPLAY GAP TABLE ──
+        _gap_scenarios_fragment()
+        
+        # Track buttons for secondary candidates (outside fragment)
+        st.markdown("**Track if near entry:**")
+        sec_enriched = _enrich_rows_with_bias(secondary_tracking_candidates)
+        btn_cols = st.columns(min(len(sec_enriched), 8))
+        for idx, trade in enumerate(sec_enriched[:8]):
+            tkr = trade.get("Ticker", "?")
+            already = _is_already_tracked(tkr)
+            near_entry = _is_near_entry_price(trade)
+            label = f"🎯 {tkr}" if already else (f"📌 {tkr}*" if near_entry else f"⏸️ {tkr}")
+            with btn_cols[idx % len(btn_cols)]:
+                if st.button(label, key=f"trk_sec_{idx}_{tkr}", use_container_width=True, disabled=already):
+                    try:
+                        entry_val = float(str(trade.get("Open", "$0")).replace("$", ""))
+                        stop_val = float(str(trade.get("Stop", "$0")).replace("$", ""))
+                        t1_val = float(str(trade.get("T1", "$0")).replace("$", ""))
+                        t2_val = float(str(trade.get("T2", "$0")).replace("$", ""))
+                        saved, _ = save_trade(
+                            ticker=trade.get("Ticker"),
+                            direction=trade.get("Direction"),
+                            entry_price=entry_val,
+                            stop_loss=stop_val,
+                            target1=t1_val,
+                            target2=t2_val,
+                            open_price=entry_val,
+                            notes=f"Tracked from {trade.get('Scenario', 'unknown')} (Confidence: {trade.get('Confidence', 'N/A')})"
+                        )
+                        if saved:
+                            st.success(f"✅ {tkr} saved to Trade Tracker")
+                    except Exception as e:
+                        st.error(f"Failed to save {tkr}: {e}")
+                    st.session_state["tracking_trades"].append(_make_track_entry(trade))
+                    st.rerun()
+        st.caption("(*) = within 0.5% of entry price. (⏸️) = outside entry range, tap to track anyway.")
+
+    # ── ENTRY CONFIRMATION TABLE — 8:30 AM CST+ (10m / 30m / 4H) ──────────
+    _replay_clock(8 * 60 + 30, "Market open — Evaluating 10m / 30m / 4H bias alignment")
+    st.markdown("### 🕣 ENTRY CONFIRMATION TABLE (8:30 AM CST+)")
+    st.markdown("All **OPENS NEAR ENTRY** with **10m · 30m · 4H** bias — anchored to 8:30 AM CST open")
+    if early_confirmation_enabled and _confirmation_candidates:
+
+        early_rows = []
+        for trade in _confirmation_candidates:
+            ticker = trade.get("Ticker", "?")
+            direction = trade.get("Direction")
+            bias_830 = get_830_bias_eval(ticker, direction, target_date=_bias_target)
+
+            b10 = bias_830.get("bias_10m", "N/A") if bias_830 else "N/A"
+            b30 = bias_830.get("bias_30m", "N/A") if bias_830 else "N/A"
+            b4h = bias_830.get("bias_4h",  "N/A") if bias_830 else "N/A"
+            aln = bias_830.get("alignment", "N/A") if bias_830 else "N/A"
+            opn = bias_830.get("today_open", "N/A") if bias_830 else "N/A"
+            cur = bias_830.get("current_price", "N/A") if bias_830 else "N/A"
+            icon = "✅" if aln == "CONFIRMED" else ("⚠️" if aln == "DIVERGED" else "")
+
+            # ── Flip direction if bias contradicts planned trade ──
+            disp_direction = direction
+            disp_option = trade.get("Option")
+            disp_stop = trade.get("Stop")
+            disp_t1 = trade.get("T1")
+            disp_t2 = trade.get("T2")
+            flipped = False
+
+            if aln == "CONFIRMED" and isinstance(opn, (int, float)):
+                bias_dir = None
+                if b10 == "BULLISH" and b30 == "BULLISH" and b4h == "BULLISH":
+                    bias_dir = "LONG"
+                elif b10 == "BEARISH" and b30 == "BEARISH" and b4h == "BEARISH":
+                    bias_dir = "SHORT"
+
+                if bias_dir and bias_dir != direction:
+                    flipped = True
+                    disp_direction = bias_dir
+                    disp_option = "CALL" if bias_dir == "LONG" else "PUT"
+                    # Mirror stop/T1/T2 around the open price
+                    def _flip_price(val_str, ref):
+                        try:
+                            v = float(str(val_str).replace("$", "").replace(",", ""))
+                            return f"${round(2 * ref - v, 2):.2f}"
+                        except Exception:
+                            return val_str
+                    disp_stop = _flip_price(disp_stop, opn)
+                    disp_t1   = _flip_price(disp_t1, opn)
+                    disp_t2   = _flip_price(disp_t2, opn)
+
+            # RR for 8:30 table
+            def _calc_rr_830(entry_val, stop_val, target_val, direction):
+                try:
+                    if direction == "LONG":
+                        risk = entry_val - stop_val
+                        reward = target_val - entry_val
+                    else:
+                        risk = stop_val - entry_val
+                        reward = entry_val - target_val
+                    return round(reward / risk, 2) if risk > 0 else 0.0
+                except: return 0.0
+            def _p830(v):
+                try: return float(str(v).replace("$","").replace(",",""))
+                except: return 0.0
+            _e830 = _p830(opn if isinstance(opn, (int, float)) else trade.get("Open", 0))
+            _s830 = _p830(disp_stop)
+            _t1_830 = _p830(disp_t1)
+            _t2_830 = _p830(disp_t2)
+            rr_t1_830 = _calc_rr_830(_e830, _s830, _t1_830, disp_direction)
+            rr_t2_830 = _calc_rr_830(_e830, _s830, _t2_830, disp_direction)
+            best_rr_830 = max(rr_t1_830, rr_t2_830)
+
+            early_rows.append({
+                "Ticker": ticker,
+                "Direction": f"{'🔄 ' if flipped else ''}{disp_direction}",
+                "Option": disp_option,
+                "Open (8:30)": f"${opn:.2f}" if isinstance(opn, (int, float)) else opn,
+                "Current": f"${cur:.2f}" if isinstance(cur, (int, float)) else cur,
+                "Stop": disp_stop,
+                "T1": disp_t1,
+                "T2": disp_t2,
+                "RR(T1)": f"{rr_t1_830:.2f}x" if rr_t1_830 else "N/A",
+                "RR(T2)": f"{rr_t2_830:.2f}x" if rr_t2_830 else "N/A",
+                "Best RR": f"{best_rr_830:.2f}x" if best_rr_830 else "N/A",
+                "10m Bias": b10,
+                "30m Bias": b30,
+                "4H Bias": b4h,
+                "Alignment": f"{icon} {aln}",
+                "Confidence": trade.get("Confidence"),
+                "ATR": trade.get("ATR"),
+                "_best_rr_830_sort": best_rr_830,
+            })
+
+        if early_rows:
+            confirmed_rows = [r for r in early_rows if "CONFIRMED" in r.get("Alignment", "")]
+            diverged_rows  = [r for r in early_rows if "DIVERGED" in r.get("Alignment", "")]
+            early_other_rows = [r for r in early_rows if "CONFIRMED" not in r.get("Alignment", "") and "DIVERGED" not in r.get("Alignment", "")]
+
+            # Color helper
+            def _color_830(val):
+                if not isinstance(val, str): return ""
+                v = val.upper()
+                if "BULLISH" in v: return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+                if "BEARISH" in v: return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+                if "CONFIRMED" in v: return "color: #00e5a0; font-weight: 700"
+                if "DIVERGED" in v: return "color: #f0c040; font-weight: 700"
+                return ""
+            bias_cols_830 = ["10m Bias", "30m Bias", "4H Bias", "Alignment"]
+
+            # ── Confirmed trades (trackable) ──
+            show_confirmed = confirmed_rows + early_other_rows
+            # Sort by Best RR (highest first)
+            show_confirmed.sort(key=lambda x: x.get("_best_rr_830_sort", 0), reverse=True)
+            if show_confirmed:
+                conf_df = pd.DataFrame(show_confirmed)
+                if "_best_rr_830_sort" in conf_df.columns:
+                    conf_df = conf_df.drop(columns=["_best_rr_830_sort"])
+                cols_830 = [c for c in bias_cols_830 if c in conf_df.columns]
+                styled_conf = conf_df.style.applymap(_color_830, subset=cols_830)
+                st.dataframe(styled_conf, use_container_width=True, height=min(40 * max(len(conf_df), 1) + 38, 400))
+                st.success(f"🎯 {len(confirmed_rows)} trade(s) CONFIRMED — all biases aligned!")
+
+                # ── Auto-track confirmed 8:30 AM trades ──
+                for cr in confirmed_rows:
+                    _tkr = cr.get("Ticker", "?")
+                    if not _is_already_tracked(_tkr):
+                        _dir = cr.get("Direction", "").replace("🔄 ", "")
+                        _entry_val = cr.get("Open (8:30)", "$0").replace("$", "").replace(",", "")
+                        _stop_val  = cr.get("Stop", "$0").replace("$", "").replace(",", "") if isinstance(cr.get("Stop"), str) else str(cr.get("Stop", 0))
+                        _t1_val    = cr.get("T1", "$0").replace("$", "").replace(",", "") if isinstance(cr.get("T1"), str) else str(cr.get("T1", 0))
+                        _t2_val    = cr.get("T2", "$0").replace("$", "").replace(",", "") if isinstance(cr.get("T2"), str) else str(cr.get("T2", 0))
+                        try:
+                            # Auto-save to database
+                            save_trade(
+                                ticker=_tkr,
+                                direction=_dir,
+                                entry_price=float(_entry_val),
+                                stop_loss=float(_stop_val),
+                                target1=float(_t1_val),
+                                target2=float(_t2_val),
+                                open_price=float(_entry_val),
+                                notes=f"Auto-tracked at 8:30 AM (Confidence: {cr.get('Confidence', 'N/A')})"
+                            )
+                        except (ValueError, TypeError) as e:
+                            print(f"⚠️ Auto-save failed for {_tkr}: {e}")
+                        try:
+                            _e8t = float(_entry_val)
+                            _s8t = float(_stop_val)
+                            _t18t = float(_t1_val)
+                            _t28t = float(_t2_val)
+                            def _rr8t(e, s, t, d):
+                                try:
+                                    risk = (e-s) if d=="LONG" else (s-e)
+                                    rew  = (t-e) if d=="LONG" else (e-t)
+                                    return round(rew/risk, 2) if risk > 0 else 0.0
+                                except: return 0.0
+                            _rr1_8t = _rr8t(_e8t, _s8t, _t18t, _dir)
+                            _rr2_8t = _rr8t(_e8t, _s8t, _t28t, _dir)
+                            st.session_state["tracking_trades"].append({
+                                "ticker": _tkr,
+                                "entry": _e8t,
+                                "stop": _s8t,
+                                "t1": _t18t,
+                                "t2": _t28t,
+                                "direction": _dir,
+                                "confidence": cr.get("Confidence", "N/A"),
+                                "atr": cr.get("ATR", "").replace("$", "") if isinstance(cr.get("ATR"), str) else str(cr.get("ATR", "")),
+                                "scenario": "8:30 CONFIRMED",
+                                "rr_t1": _rr1_8t,
+                                "rr_t2": _rr2_8t,
+                                "best_rr": max(_rr1_8t, _rr2_8t),
+                                "tracking_start_time": get_cst_now().isoformat(),
+                            })
+                        except (ValueError, TypeError):
+                            pass
+            else:
+                st.info("⏳ No confirmed trades yet.")
+
+            # ── Diverged trades (separate table, not tracked) ──
+            if diverged_rows:
+                st.markdown("#### ⚠️ DIVERGED — Do Not Track")
+                st.caption("These trades have conflicting bias — removed from tracking candidates.")
+                div_df = pd.DataFrame(diverged_rows)
+                cols_830_div = [c for c in bias_cols_830 if c in div_df.columns]
+                styled_div = div_df.style.applymap(_color_830, subset=cols_830_div)
+                st.dataframe(styled_div, use_container_width=True, height=min(40 * max(len(div_df), 1) + 38, 400))
+        else:
+            st.info("⏳ Waiting for 8:30 AM CST data...")
+    else:
+        if not early_confirmation_enabled:
+            st.info("⏳ Waiting for 8:30 AM CST to evaluate biases...")
+        elif not _confirmation_candidates:
+            st.info("📋 No OPENS NEAR ENTRY candidates yet. Run Check Open Prices first.")
+
+    # ── ENTRY CONFIRMATION TABLE — 9:00 AM CST+ (10m + 4H) ──────────
+    st.markdown("---")
+    _replay_clock(9 * 60, "30 min into session — Re-evaluating with 10m + 4H bias")
+    st.markdown("### ✅ ENTRY CONFIRMATION TABLE (9:00 AM CST+)")
+    st.markdown("Trades with **CONFIRMED** 10m + 4H bias — ready to enter")
+    if entry_confirmation_enabled and _confirmation_candidates:
+
+        confirmation_rows = []
+        for trade in _confirmation_candidates:
+            ticker = trade.get("Ticker", "?")
+            direction = trade.get("Direction")
+            entry_p = trade.get("Entry") or trade.get("Open")
+            try:
+                entry_val = float(str(entry_p).replace("$", "").replace(",", ""))
+            except Exception:
+                entry_val = 0
+            bias_eval = get_multiframe_bias_eval(ticker, entry_val, direction, target_date=_bias_target)
+
+            if bias_eval and bias_eval.get("alignment") == "CONFIRMED":
+                # RR for 9:00 confirmation table
+                def _p9(v):
+                    try: return float(str(v).replace("$","").replace(",",""))
+                    except: return 0.0
+                _e9 = _p9(bias_eval.get('current_price', 0))
+                _s9 = _p9(trade.get("Stop", 0))
+                _t19 = _p9(trade.get("T1", 0))
+                _t29 = _p9(trade.get("T2", 0))
+                def _rr9(e, s, t, d):
+                    try:
+                        risk = (e - s) if d == "LONG" else (s - e)
+                        rew  = (t - e) if d == "LONG" else (e - t)
+                        return round(rew / risk, 2) if risk > 0 else 0.0
+                    except: return 0.0
+                _rr1_9 = _rr9(_e9, _s9, _t19, direction)
+                _rr2_9 = _rr9(_e9, _s9, _t29, direction)
+                _best9 = max(_rr1_9, _rr2_9)
+                confirmation_rows.append({
+                    "Ticker": ticker,
+                    "Direction": direction,
+                    "Option": trade.get("Option"),
+                    "Current": f"${bias_eval['current_price']:.2f}",
+                    "Stop": trade.get("Stop"),
+                    "T1": trade.get("T1"),
+                    "T2": trade.get("T2"),
+                    "RR(T1)": f"{_rr1_9:.2f}x",
+                    "RR(T2)": f"{_rr2_9:.2f}x",
+                    "Best RR": f"{_best9:.2f}x",
+                    f"{bias_eval['tf_short']} Bias": bias_eval.get("bias_10min"),
+                    f"{bias_eval['tf_long']} Bias": bias_eval.get("bias_30min"),
+                    "Alignment": f"✅ CONFIRMED",
+                    "Confidence": trade.get("Confidence"),
+                    "ATR": trade.get("ATR"),
+                    "_best_rr_sort": _best9,
+                })
+
+        if confirmation_rows:
+            # Sort by Best RR (highest first)
+            confirmation_rows.sort(key=lambda x: x.get("_best_rr_sort", 0), reverse=True)
+            confirm_df = pd.DataFrame(confirmation_rows)
+            if "_best_rr_sort" in confirm_df.columns:
+                confirm_df = confirm_df.drop(columns=["_best_rr_sort"])
+            st.dataframe(confirm_df, use_container_width=True, height=min(40 * max(len(confirm_df), 1) + 38, 400))
+            st.success(f"🎯 {len(confirmation_rows)} trade(s) ready for entry with confirmed bias!")
+
+            # ── Auto-track confirmed 9:00 AM trades ──
+            for cr9 in confirmation_rows:
+                _tkr9 = cr9.get("Ticker", "?")
+                if not _is_already_tracked(_tkr9):
+                    _dir9 = cr9.get("Direction", "LONG")
+                    _stop9 = cr9.get("Stop", "$0").replace("$", "").replace(",", "") if isinstance(cr9.get("Stop"), str) else str(cr9.get("Stop", 0))
+                    _t1_9  = cr9.get("T1", "$0").replace("$", "").replace(",", "") if isinstance(cr9.get("T1"), str) else str(cr9.get("T1", 0))
+                    _t2_9  = cr9.get("T2", "$0").replace("$", "").replace(",", "") if isinstance(cr9.get("T2"), str) else str(cr9.get("T2", 0))
+                    _cur9  = cr9.get("Current", "$0").replace("$", "").replace(",", "") if isinstance(cr9.get("Current"), str) else str(cr9.get("Current", 0))
+                    try:
+                        # Auto-save to database
+                        save_trade(
+                            ticker=_tkr9,
+                            direction=_dir9,
+                            entry_price=float(_cur9),
+                            stop_loss=float(_stop9),
+                            target1=float(_t1_9),
+                            target2=float(_t2_9),
+                            open_price=float(_cur9),
+                            notes=f"Auto-tracked at 9:00 AM (Confidence: {cr9.get('Confidence', 'N/A')})"
+                        )
+                    except (ValueError, TypeError) as e:
+                        print(f"⚠️ Auto-save failed for {_tkr9}: {e}")
+                    try:
+                        _e9t = float(_cur9)
+                        _s9t = float(_stop9)
+                        _t19t = float(_t1_9)
+                        _t29t = float(_t2_9)
+                        def _rr9t(e, s, t, d):
+                            try:
+                                risk = (e-s) if d=="LONG" else (s-e)
+                                rew  = (t-e) if d=="LONG" else (e-t)
+                                return round(rew/risk, 2) if risk > 0 else 0.0
+                            except: return 0.0
+                        _rr1_9t = _rr9t(_e9t, _s9t, _t19t, _dir9)
+                        _rr2_9t = _rr9t(_e9t, _s9t, _t29t, _dir9)
+                        st.session_state["tracking_trades"].append({
+                            "ticker": _tkr9,
+                            "entry": _e9t,
+                            "stop": _s9t,
+                            "t1": _t19t,
+                            "t2": _t29t,
+                            "direction": _dir9,
+                            "confidence": cr9.get("Confidence", "N/A"),
+                            "atr": cr9.get("ATR", "").replace("$", "") if isinstance(cr9.get("ATR"), str) else str(cr9.get("ATR", "")),
+                            "scenario": "9:00 CONFIRMED",
+                            "rr_t1": _rr1_9t,
+                            "rr_t2": _rr2_9t,
+                            "best_rr": max(_rr1_9t, _rr2_9t),
+                            "tracking_start_time": get_cst_now().isoformat(),
+                        })
+                    except (ValueError, TypeError):
+                        pass
+        else:
+            st.info("⏳ No trades with confirmed bias yet. Check again in a moment...")
+    else:
+        if not entry_confirmation_enabled:
+            st.info("⏳ Waiting for 9:00 AM CST to evaluate biases...")
+        elif not _confirmation_candidates:
+            st.info("📋 No OPENS NEAR ENTRY candidates yet. Run Check Open Prices first.")
+
+    _replay_clock(9 * 60 + 30, "Session in progress — Scenario tables & final classification")
+
+    st.markdown("---")
+    if display_cols and scenario_other_rows:
+        _render_trackable_table(scenario_other_rows, "📊 All Other Scenarios", "other", display_cols)
+    else:
+        st.info("No additional scenarios to render yet.")
+
 # ── Next Day Planning handler ────────────────────────
 if plan_run:
   with tab_plan:
@@ -5299,6 +8315,16 @@ if plan_run:
                     profile     = _classify_instrument(ticker, p_daily)
                     is_mean_rev = profile["is_mean_rev"]
                     intraday_note = "⚠️ ETF/mean-rev — intraday only, no swing" if is_mean_rev else ""
+                    # RR ratios for plan
+                    def _plan_rr(e, s, t, d):
+                        try:
+                            risk = (e - s) if d == "LONG" else (s - e)
+                            rew  = (t - e) if d == "LONG" else (e - t)
+                            return round(rew / risk, 2) if risk > 0 else 0.0
+                        except: return 0.0
+                    _rr1_pl = _plan_rr(entry, intra_stop, intra_t1, direction)
+                    _rr2_pl = _plan_rr(entry, intra_stop, intra_t2, direction)
+                    _best_rr_pl = max(_rr1_pl, _rr2_pl)
                     plan_rows.append({
                         "Ticker": ticker,
                         "Grade": grade_info["entry_grade"],
@@ -5312,13 +8338,17 @@ if plan_run:
                         "Best Setup": "Y" if best_setup else "N",
                         "Close": round(entry, 2),
                         "ATR": round(atr_1d, 2),
-                        "Intra Stop": intra_stop,
-                        "Intra T1": intra_t1,
-                        "Intra T2": intra_t2,
-                        "Risk $": intra_stop_dist,
-                        "T1 Reward $": intra_t1_dist,
-                        "T2 Reward $": intra_t2_dist,
-                        "ATM Strike": atm_strike,
+                        "Intra Stop": round(intra_stop, 2),
+                        "Intra T1": round(intra_t1, 2),
+                        "Intra T2": round(intra_t2, 2),
+                        "RR(T1)": f"{_rr1_pl:.2f}x",
+                        "RR(T2)": f"{_rr2_pl:.2f}x",
+                        "Best RR": f"{_best_rr_pl:.2f}x",
+                        "_best_rr_sort": _best_rr_pl,
+                        "Risk $": round(intra_stop_dist, 2),
+                        "T1 Reward $": round(intra_t1_dist, 2),
+                        "T2 Reward $": round(intra_t2_dist, 2),
+                        "ATM Strike": round(atm_strike, 2),
                         "Aggressive": aggressive,
                         "Moderate": moderate,
                         "Conservative": conservative,
@@ -5347,6 +8377,60 @@ if plan_run:
                         plan_rows[-1]["Long TF"] = ""
                         plan_rows[-1]["Long Bias"] = "N/A"
                         plan_rows[-1]["Bias Align"] = "—"
+
+                    # Add 10m / 30m / 4H bias (plan_date + 1, or live if today)
+                    _plan_bias_date = None if plan_date == date.today() else plan_date + timedelta(days=1)
+                    bias_830 = get_830_bias_eval(ticker, direction, target_date=_plan_bias_date)
+                    plan_rows[-1]["10m Bias"] = bias_830.get("bias_10m", "N/A") if bias_830 else "N/A"
+                    plan_rows[-1]["30m Bias"] = bias_830.get("bias_30m", "N/A") if bias_830 else "N/A"
+                    plan_rows[-1]["4H Bias"]  = bias_830.get("bias_4h",  "N/A") if bias_830 else "N/A"
+
+                    # ── Adjust Verdict based on bias alignment ──
+                    _row = plan_rows[-1]
+                    _b10 = _row.get("10m Bias", "N/A")
+                    _b30 = _row.get("30m Bias", "N/A")
+                    _b4h = _row.get("4H Bias", "N/A")
+                    _sbi = _row.get("Short Bias", "N/A")
+                    _lbi = _row.get("Long Bias", "N/A")
+                    _all_biases = [b for b in [_b10, _b30, _b4h, _sbi, _lbi] if b not in ("N/A", "")]
+                    if _all_biases:
+                        _n_bull = sum(1 for b in _all_biases if b == "BULLISH")
+                        _n_bear = sum(1 for b in _all_biases if b == "BEARISH")
+                        _total  = len(_all_biases)
+                        _orig_verdict = _row["Verdict"]
+                        if _n_bull == _total:
+                            # All biases bullish
+                            _row["Verdict"] = "BULLISH"
+                            _row["Direction"] = "LONG"
+                            _row["Option"] = "CALL"
+                        elif _n_bear == _total:
+                            # All biases bearish
+                            _row["Verdict"] = "BEARISH"
+                            _row["Direction"] = "SHORT"
+                            _row["Option"] = "PUT"
+                        elif _n_bull >= _total * 0.6:
+                            _row["Verdict"] = "LEAN BULLISH"
+                            _row["Direction"] = "LONG"
+                            _row["Option"] = "CALL"
+                        elif _n_bear >= _total * 0.6:
+                            _row["Verdict"] = "LEAN BEARISH"
+                            _row["Direction"] = "SHORT"
+                            _row["Option"] = "PUT"
+                        # If direction flipped, recalculate stop/targets
+                        if _row["Direction"] != direction:
+                            _e = _row["Close"]
+                            _a = _row["ATR"]
+                            _sd = round(_a * 0.3, 2)
+                            _t1d = round(_a * 0.5, 2)
+                            _t2d = round(_a * 0.8, 2)
+                            if _row["Direction"] == "LONG":
+                                _row["Intra Stop"] = round(_e - _sd, 2)
+                                _row["Intra T1"] = round(_e + _t1d, 2)
+                                _row["Intra T2"] = round(_e + _t2d, 2)
+                            else:
+                                _row["Intra Stop"] = round(_e + _sd, 2)
+                                _row["Intra T1"] = round(_e - _t1d, 2)
+                                _row["Intra T2"] = round(_e - _t2d, 2)
                 except:
                     continue
 
@@ -5356,23 +8440,46 @@ if plan_run:
             if not plan_rows:
                 st.info("No actionable signals generated for the given tickers.")
             else:
+                # Sort plan_rows by Best RR (highest first)
+                plan_rows.sort(key=lambda x: x.get("_best_rr_sort", 0), reverse=True)
                 plan_df = pd.DataFrame(plan_rows)
+                if "_best_rr_sort" in plan_df.columns:
+                    plan_df = plan_df.drop(columns=["_best_rr_sort"])
 
                 # ── Compact symbol summary table ───────────────────────────
                 summary_cols = ["Ticker", "Direction", "Option", "Grade",
                                 "Verdict", "Confidence", "Close", "ATR",
                                 "Intra Stop", "Intra T1", "Intra T2",
-                                "ATM Strike", "0DTE Exp", "2-3DTE Exp",
-                                "Short Bias", "Long Bias", "Bias Align"]
+                                "RR(T1)", "RR(T2)", "Best RR",
+                                "ATM Strike",
+                                "10m Bias", "30m Bias", "4H Bias",
+                                "Short Bias", "Long Bias", "Bias Align",
+                                "0DTE Exp", "2-3DTE Exp"]
                 summary_cols = [c for c in summary_cols if c in plan_df.columns]
                 summary_df = plan_df[summary_cols].copy()
+                # Format numeric price columns to 2 decimal places
+                _price_cols = ["Close", "ATR", "Intra Stop", "Intra T1", "Intra T2", "ATM Strike"]
+                for _pc in _price_cols:
+                    if _pc in summary_df.columns:
+                        summary_df[_pc] = summary_df[_pc].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
                 summary_df.rename(columns={
                     "Intra Stop": "Stop", "Intra T1": "T1",
                     "Intra T2": "T2", "ATM Strike": "ATM",
                     "0DTE Exp": "0DTE", "2-3DTE Exp": "2-3DTE",
                 }, inplace=True)
+                if "_best_rr_sort" in summary_df.columns:
+                    summary_df = summary_df.drop(columns=["_best_rr_sort"])
                 st.markdown("#### 📋 All Symbols")
-                st.dataframe(summary_df, use_container_width=True,
+                # Color the 10m/30m/4H bias columns
+                def _color_plan_bias(val):
+                    if not isinstance(val, str): return ""
+                    v = val.upper()
+                    if "BULLISH" in v: return "background-color: #0a3d1f; color: #00e5a0; font-weight: 700"
+                    if "BEARISH" in v: return "background-color: #3d0a1a; color: #ff4d6a; font-weight: 700"
+                    return ""
+                _bias_style_cols = [c for c in ["10m Bias", "30m Bias", "4H Bias"] if c in summary_df.columns]
+                styled_summary = summary_df.style.applymap(_color_plan_bias, subset=_bias_style_cols) if _bias_style_cols else summary_df
+                st.dataframe(styled_summary, use_container_width=True,
                              hide_index=True, height=min(38*len(summary_df)+38, 320))
                 longs = [r for r in plan_rows if r["Direction"] == "LONG"]
                 shorts = [r for r in plan_rows if r["Direction"] == "SHORT"]
@@ -5393,7 +8500,7 @@ if plan_run:
                         + "".join(
                             f'<div style="font-size:12px;color:#e8ecff;margin-bottom:2px">'
                             f'<b>{r["Ticker"]}</b> — {r["Option"]} · ATM ${r["ATM Strike"]:.0f} · '
-                            f'Stop ${r["Intra Stop"]:.2f} · T1 ${r["Intra T1"]:.2f} · T2 ${r["Intra T2"]:.2f}</div>'
+                            f'Stop ${r["Intra Stop"]:.2f} · T1 ${r["Intra T1"]:.2f} · T2 ${r["Intra T2"]:.2f} · RR {r.get("Best RR", "N/A")}</div>'
                             for r in best
                         )
                         + '</div>',
@@ -5420,6 +8527,7 @@ if plan_run:
                         f'<span style="color:#6b7099">Stop: <b style="color:#ff4d6a">${r["Intra Stop"]:.2f}</b> (-${r["Risk $"]:.2f})</span>'
                         f'<span style="color:#6b7099">T1: <b style="color:#00e5a0">${r["Intra T1"]:.2f}</b> (+${r["T1 Reward $"]:.2f})</span>'
                         f'<span style="color:#6b7099">T2: <b style="color:#22d3ee">${r["Intra T2"]:.2f}</b> (+${r["T2 Reward $"]:.2f})</span>'
+                        f'<span style="color:#6b7099">Best RR: <b style="color:#f0c040">{r.get("Best RR", "N/A")}</b></span>'
                         f'</div>'
                         # Option strikes
                         f'<div style="background:#090b13;border:1px solid #1a1d2e;border-radius:4px;padding:10px;margin-bottom:8px">'
@@ -5451,492 +8559,6 @@ if plan_run:
                     file_name=f"intraday_plan_{date.today()}.csv",
                     mime="text/csv", use_container_width=True,
                 )
-
-# ── Check Open Prices ──────────────────────────────────────
-if check_open_run:
-  with tab_plan:
-    saved_plan = st.session_state.get("plan_data", [])
-    if not saved_plan:
-        st.warning("Generate a plan first, then check open prices.")
-    elif not YFINANCE_AVAILABLE:
-        st.error("yfinance is required for live price checks.")
-    else:
-        check_date = plan_date
-        is_live    = (check_date == date.today())
-        date_header = st.empty()
-        actual_trade_date = None
-        open_status = st.empty()
-        fetch_errors = []
-        shown = 0
-        table_rows = []  # Collect all scenario results for table
-
-        for i, r in enumerate(saved_plan):
-            if not isinstance(r, dict):
-                continue
-            ticker = r.get("Ticker") or r.get("ticker", "UNKNOWN")
-            open_status.text(f"Fetching {ticker}... ({i+1}/{len(saved_plan)})")
-            try:
-                # Pull every field defensively — handles stale plan rows
-                entry      = r.get("Close") or r.get("entry")
-                intra_stop = r.get("Intra Stop")
-                intra_t1   = r.get("Intra T1")
-                intra_t2   = r.get("Intra T2")
-                atm_strike = r.get("ATM Strike")
-                atr_val    = r.get("ATR")
-                direction  = r.get("Direction")
-                opt_type   = r.get("Option")
-                confidence = r.get("Confidence", "N/A")
-                exp_0dte   = r.get("0DTE Exp", "")
-                exp_2dte   = r.get("2-3DTE Exp", "")
-                txt_gap    = r.get("If big gap", "N/A")
-                txt_near   = r.get("If opens near entry", "N/A")
-                txt_btwn   = r.get("If opens between entry & stop", "N/A")
-                txt_past   = r.get("If opens past stop", "N/A")
-
-                missing = [k for k, v in {
-                    "Close": entry, "Intra Stop": intra_stop, "Intra T1": intra_t1,
-                    "ATM Strike": atm_strike, "ATR": atr_val, "Direction": direction,
-                }.items() if v is None]
-                if missing:
-                    fetch_errors.append(f"{ticker}: missing {missing} — regenerate plan")
-                    continue
-
-                entry=float(entry); intra_stop=float(intra_stop); intra_t1=float(intra_t1)
-                intra_t2=float(intra_t2) if intra_t2 is not None else intra_t1
-                atm_strike=float(atm_strike); atr_val=float(atr_val)
-
-                # Fetch live price via yfinance
-                tk = yf.Ticker(ticker)
-                today_hist = (tk.history(period="1d") if is_live else
-                              tk.history(start=str(check_date + timedelta(days=1)),
-                                         end=str(check_date + timedelta(days=7))))
-
-                if today_hist is None or (hasattr(today_hist, "empty") and today_hist.empty):
-                    fetch_errors.append(f"{ticker}: no data — market may not be open yet")
-                    continue
-
-                # ── Robust price extraction — handles all yfinance column formats ──
-                # yfinance can return: plain columns, MultiIndex (field, ticker),
-                # or MultiIndex (ticker, field) depending on version and ticker alias.
-                def _extract_price(df, field, row_idx):
-                    """Extract a single price value from a yfinance DataFrame robustly."""
-                    cols = df.columns
-                    # 1. Plain columns: ["Open", "High", ...]
-                    if field in cols:
-                        val = df[field].iloc[row_idx]
-                        if val is not None and str(val) != "nan":
-                            return float(val)
-                    # 2. MultiIndex — try (field, *) pattern
-                    if hasattr(cols, "levels"):
-                        for col in cols:
-                            if isinstance(col, tuple) and col[0] == field:
-                                val = df[col].iloc[row_idx]
-                                if val is not None and str(val) != "nan":
-                                    return float(val)
-                        # 3. MultiIndex — try (*, field) pattern
-                        for col in cols:
-                            if isinstance(col, tuple) and col[-1] == field:
-                                val = df[col].iloc[row_idx]
-                                if val is not None and str(val) != "nan":
-                                    return float(val)
-                    # 4. Last resort — positional (Open=col0, Close=col3)
-                    pos = {"Open": 0, "Close": 3}
-                    if field in pos and len(df.columns) > pos[field]:
-                        val = df.iloc[row_idx, pos[field]]
-                        if val is not None:
-                            return float(val)
-                    raise ValueError(f"Cannot extract {field} from DataFrame columns: {list(cols)[:6]}")
-
-                open_price    = _extract_price(today_hist, "Open",  0)
-                current_price = _extract_price(today_hist, "Close", -1)
-
-                # Fetch option data for the strike
-                opt_prev_open = opt_prev_high = opt_prev_low = opt_prev_close = opt_curr_open = None
-                try:
-                    # Try yfinance first
-                    stock = yf.Ticker(ticker)
-                    expirations = stock.options
-                    if expirations:
-                        exp_date = expirations[0]
-                        opt_chain = stock.option_chain(exp_date)
-                        calls = opt_chain.calls if dopt == "CALL" else opt_chain.puts
-                        calls = calls.sort_values(by='strike')
-                        closest_strike = calls.iloc[(calls['strike'] - atm_strike).abs().argsort()[0]]
-                        if not closest_strike.empty:
-                            opt_curr_open = closest_strike.get('lastPrice', None)
-                            opt_prev_open = opt_curr_open
-                            opt_prev_close = opt_curr_open
-                except:
-                    # Fallback to Alpaca
-                    try:
-                        if api_key and api_secret:
-                            headers = {
-                                'APCA-API-KEY-ID': api_key,
-                                'APCA-API-SECRET-KEY': api_secret,
-                            }
-                            base_url = "https://api.alpaca.markets"
-                            resp = requests.get(
-                                f"{base_url}/v1beta1/options/snapshots/{ticker}",
-                                headers=headers,
-                                timeout=10
-                            )
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                snapshots = data.get('snapshots', [])
-                                for snap in snapshots:
-                                    contract = snap.get('option_details', {})
-                                    strike = contract.get('strike_price')
-                                    if strike and abs(strike - atm_strike) < 0.5:
-                                        opt_curr_open = snap.get('latest_quote', {}).get('last_quote', {}).get('ask')
-                                        if opt_curr_open:
-                                            opt_prev_open = opt_curr_open
-                                            opt_prev_close = opt_curr_open
-                                        break
-                    except:
-                        pass
-
-                if actual_trade_date is None:
-                    actual_trade_date = str(today_hist.index[0])[:10]
-                    date_label = "Live" if is_live else actual_trade_date
-                    date_header.markdown(f"### ☀️ Morning Open — Which Scenario? ({date_label})")
-
-                gap_thr  = round(entry * 0.005, 2)
-                move_raw = open_price - entry
-                move_pct = move_raw / entry * 100
-
-                if direction == "LONG":
-                    if open_price - entry > gap_thr:
-                        sc,lb,col,txt = "big_gap",   "⚠️ BIG GAP UP",               "#f5c842", txt_gap
-                    elif open_price >= entry:
-                        sc,lb,col,txt = "near_entry","✅ OPENS NEAR ENTRY",               "#00e5a0", txt_near
-                    elif open_price > intra_stop:
-                        sc,lb,col,txt = "between",   "⚡ OPENS BETWEEN ENTRY & STOP",     "#4d9fff", txt_btwn
-                    else:
-                        sc,lb,col,txt = "past_stop", "❌ OPENS PAST STOP",                "#ff4d6a", txt_past
-                else:
-                    if entry - open_price > gap_thr:
-                        sc,lb,col,txt = "big_gap",   "⚠️ BIG GAP DOWN",             "#f5c842", txt_gap
-                    elif open_price <= entry:
-                        sc,lb,col,txt = "near_entry","✅ OPENS NEAR ENTRY",               "#00e5a0", txt_near
-                    elif open_price < intra_stop:
-                        sc,lb,col,txt = "between",   "⚡ OPENS BETWEEN ENTRY & STOP",     "#4d9fff", txt_btwn
-                    else:
-                        sc,lb,col,txt = "past_stop", "❌ OPENS PAST STOP",                "#ff4d6a", txt_past
-
-                dd=direction; dopt=opt_type or "CALL"
-                ds=intra_stop; dt1=intra_t1; dt2=intra_t2; da=atm_strike
-
-                if sc == "past_stop":
-                    fd=round(atr_val*0.3,2); f1=round(atr_val*0.5,2); f2=round(atr_val*0.8,2)
-                    if direction == "LONG":
-                        dd="SHORT"; dopt="PUT"
-                        ds=round(open_price+fd,2); dt1=round(open_price-f1,2); dt2=round(open_price-f2,2)
-                    else:
-                        dd="LONG";  dopt="CALL"
-                        ds=round(open_price-fd,2); dt1=round(open_price+f1,2); dt2=round(open_price+f2,2)
-                    si = 5 if open_price>=200 else (2.5 if open_price>=50 else (1 if open_price>=20 else 0.5))
-                    da  = round(round(open_price/si)*si, 2)
-                    txt = f"Flipped to {dopt} at ~${open_price:.2f} — stop ${ds:.2f}, T1 ${dt1:.2f}, T2 ${dt2:.2f}"
-
-                dc  = "#00e5a0" if dd == "LONG" else "#ff4d6a"
-                ico = "📞" if dopt == "CALL" else "📉"
-                shown += 1
-
-                st.markdown(
-                    f'<div style="background:#0d0f17;border:1px solid #1a1d2e;border-left:4px solid {col};'
-                    f'padding:14px 18px;border-radius:4px;margin-bottom:8px">'
-                    f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
-                    f'<span style="font-size:15px;font-weight:900;color:#e8ecff">{ico} {ticker} — {dopt}'
-                    f'{"  🔄 FLIPPED" if sc=="past_stop" else ""}</span>'
-                    f'<span style="color:{dc};font-weight:700;font-size:12px">{dd} · {confidence}</span>'
-                    f'</div>'
-                    f'<div style="display:flex;gap:16px;font-size:12px;margin-bottom:8px;flex-wrap:wrap">'
-                    f'<span style="color:#6b7099">Prev Close: <b style="color:#e8ecff">${entry:.2f}</b></span>'
-                    f'<span style="color:#6b7099">Open: <b style="color:#f5c842">${open_price:.2f}</b></span>'
-                    f'<span style="color:#6b7099">Current: <b style="color:#a78bfa">${current_price:.2f}</b></span>'
-                    f'<span style="color:#6b7099">Move: <b style="color:{"#00e5a0" if move_raw>=0 else "#ff4d6a"}>'
-                    f'{"+" if move_raw>=0 else ""}${move_raw:.2f} ({move_pct:+.2f}%)</b></span>'
-                    f'</div>'
-                    f'<div style="background:{col}15;border:1px solid {col}40;'
-                    f'border-radius:6px;padding:10px 14px;margin-bottom:6px">'
-                    f'<div style="font-size:13px;font-weight:700;color:{col};margin-bottom:4px">{lb}</div>'
-                    f'<div style="font-size:11px;color:#e8ecff">{txt}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                # ── Spread suggestion ─────────────────────────────────────
-                _sinc   = 5 if da >= 200 else (2.5 if da >= 50 else (1 if da >= 20 else 0.5))
-                _raw    = (da - atr_val * 2) if dopt == "PUT" else (da + atr_val * 2)
-                _leg2   = round(round(_raw / _sinc) * _sinc, 2)
-                _spread = f"{da:.0f}–{_leg2:.0f}"
-
-                st.markdown(
-                    f'<div style="font-size:10px;color:#6b7099;padding:4px 18px 0">'
-                    f'ATR: <b style="color:#a78bfa">${atr_val:.2f}</b> &nbsp;·&nbsp; '
-                    f'Stop: ${ds:.2f} &nbsp;·&nbsp; T1: ${dt1:.2f} &nbsp;·&nbsp; T2: ${dt2:.2f} &nbsp;·&nbsp; '
-                    f'ATM: <b style="color:{dc}">${da:.0f} {dopt}</b> &nbsp;·&nbsp; Exp: {exp_0dte} / {exp_2dte}</div>'
-                    f'<div style="font-size:11px;font-weight:600;color:#4d9fff;padding:3px 18px 12px">'
-                    f'{ticker} &nbsp; {dopt} SPREAD &nbsp; {_spread} &nbsp; Exp: {exp_0dte} / {exp_2dte}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                # Append row to table
-                table_rows.append({
-                    "Ticker": ticker,
-                    "Direction": dd,
-                    "Option": dopt,
-                    "Stop": f"${ds:.2f}",
-                    "ATM": f"${da:.0f}",
-                    "Spread": _spread,
-                    "Exp 0DTE": exp_0dte,
-                    "Exp 2-3DTE": exp_2dte,
-                    "Confidence": confidence,
-                    "ATR": f"${atr_val:.2f}",
-                    "Prev Close": f"${entry:.2f}",
-                    "Prev Opt O": f"${opt_prev_open:.2f}" if opt_prev_open else "N/A",
-                    "Prev Opt H": f"${opt_prev_high:.2f}" if opt_prev_high else "N/A",
-                    "Prev Opt L": f"${opt_prev_low:.2f}" if opt_prev_low else "N/A",
-                    "Prev Opt C": f"${opt_prev_close:.2f}" if opt_prev_close else "N/A",
-                    "Open": f"${open_price:.2f}",
-                    "Opt Open": f"${opt_curr_open:.2f}" if opt_curr_open else "N/A",
-                    "T1": f"${dt1:.2f}",
-                    "T2": f"${dt2:.2f}",
-                    "Current": f"${current_price:.2f}",
-                    "Move": f"${move_raw:.2f} ({move_pct:+.2f}%)",
-                    "Scenario": lb,
-                    "Notes": txt[:50] + "..." if len(txt) > 50 else txt,
-                    "_scenario_id": sc,
-                })
-            except Exception as exc:
-                fetch_errors.append(f"{ticker}: {type(exc).__name__}: {exc}")
-
-        open_status.empty()
-        if shown == 0 and not fetch_errors:
-            st.info("No data returned — market may not be open yet, or regenerate plan.")
-        if fetch_errors:
-            with st.expander(f"⚠️ {len(fetch_errors)} issue(s)", expanded=True):
-                for e in fetch_errors:
-                    st.caption(e)
-
-        # Persist table_rows so they survive st.rerun() after track-button clicks
-        if table_rows:
-            st.session_state["open_check_table_rows"] = table_rows
-
-# ── Display persisted scenario tables & tracker (survives rerun) ──
-if st.session_state.get("open_check_table_rows"):
-  with tab_plan:
-    table_rows = st.session_state["open_check_table_rows"]
-    st.markdown("---")
-    conf_priority = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-    near_entry_rows = [r for r in table_rows if r.get("Scenario", "").strip().startswith("✅ OPENS NEAR ENTRY")]
-
-    # Check if we should enable auto-tracking (8:30 AM CST or later)
-    auto_track_enabled = is_after_market_time(8, 30)  # 8:30 AM CST
-    entry_confirmation_enabled = is_after_market_time(9, 0)  # 9:00 AM CST
-
-    # Ensure tracking list exists
-    if "tracking_trades" not in st.session_state:
-        st.session_state["tracking_trades"] = []
-
-    def _make_track_entry(trade):
-        """Build a tracking dict from a table row."""
-        return {
-            "ticker": trade.get("Ticker"),
-            "entry": float(trade.get("Open", "$0").replace("$", "")),
-            "stop": float(trade.get("Stop", "$0").replace("$", "")),
-            "t1": float(trade.get("T1", "$0").replace("$", "")),
-            "t2": float(trade.get("T2", "$0").replace("$", "")),
-            "direction": trade.get("Direction"),
-            "confidence": trade.get("Confidence", "N/A"),
-            "atr": trade.get("ATR", "$0").replace("$", ""),
-            "scenario": trade.get("Scenario", ""),
-            "tracking_start_time": get_cst_now().isoformat(),
-        }
-
-    def _is_already_tracked(ticker):
-        return any(t["ticker"] == ticker for t in st.session_state["tracking_trades"])
-
-    # ── AUTO-START: auto-track ALL OPENS NEAR ENTRY at 8:30 AM CST+ ──
-    if auto_track_enabled and near_entry_rows and not st.session_state["tracking_trades"]:
-        for trade in near_entry_rows:
-            if not _is_already_tracked(trade.get("Ticker")):
-                st.session_state["tracking_trades"].append(_make_track_entry(trade))
-
-    # ── Helper: render a scenario table with Track buttons on each row ──
-    def _render_trackable_table(rows, title, table_key, display_cols):
-        """Display a scenario table with a Track button per row."""
-        st.markdown(f"### {title}")
-        if not rows:
-            st.dataframe(pd.DataFrame(columns=display_cols), use_container_width=True, height=78)
-            return
-        df = pd.DataFrame(rows)[display_cols]
-        st.dataframe(df, use_container_width=True, height=min(40 * max(len(df), 1) + 38, 400))
-        # Track buttons row underneath the table
-        btn_cols = st.columns(min(len(rows), 8))
-        for idx, trade in enumerate(rows[:8]):
-            tkr = trade.get("Ticker", "?")
-            already = _is_already_tracked(tkr)
-            label = f"🎯 {tkr}" if already else f"📌 {tkr}"
-            with btn_cols[idx % len(btn_cols)]:
-                if st.button(label, key=f"trk_{table_key}_{idx}_{tkr}", use_container_width=True, disabled=already):
-                    st.session_state["tracking_trades"].append(_make_track_entry(trade))
-                    st.rerun()
-
-    # ── SCENARIO TABLES with per-row Track buttons ──
-    between_rows = [r for r in table_rows if r.get("Scenario", "").strip().startswith("⚡ OPENS BETWEEN ENTRY & STOP")]
-    other_rows = [r for r in table_rows if not (r.get("Scenario", "").strip().startswith("✅ OPENS NEAR ENTRY") or r.get("Scenario", "").strip().startswith("⚡ OPENS BETWEEN ENTRY & STOP"))]
-    between_rows.sort(key=lambda x: conf_priority.get(x.get("Confidence", "LOW"), 999))
-    other_rows.sort(key=lambda x: conf_priority.get(x.get("Confidence", "LOW"), 999))
-    display_cols = [c for c in table_rows[0].keys() if c != "_scenario_id"]
-    # Move Scenario and Notes right after Ticker (symbol)
-    for _move in ["Notes", "Scenario"]:
-        if _move in display_cols:
-            display_cols.remove(_move)
-            idx = display_cols.index("Ticker") + 1 if "Ticker" in display_cols else 0
-            display_cols.insert(idx, _move)
-
-    _render_trackable_table(near_entry_rows, "✅ OPENS NEAR ENTRY", "near", display_cols)
-    _render_trackable_table(between_rows, "⚡ OPENS BETWEEN ENTRY & STOP", "btwn", display_cols)
-    _render_trackable_table(other_rows, "📊 All Other Scenarios", "other", display_cols)
-
-    # ── POSITION TRACKER — multi-row table with delete buttons ──────────
-    tracked = st.session_state.get("tracking_trades", [])
-    if tracked:
-        st.markdown("---")
-        st.markdown(f"### 📍 Tracking {len(tracked)} Position(s)")
-
-        # Clear All button
-        if st.button("❌ Clear All Tracking", key="clear_all_tracking"):
-            st.session_state["tracking_trades"] = []
-            st.rerun()
-
-        import yfinance as yf
-        track_rows = []
-        error_tickers = []
-        for ti, tr in enumerate(tracked):
-            try:
-                tk = yf.Ticker(tr['ticker'])
-                hist = tk.history(period="5d")
-                if hist.empty:
-                    error_tickers.append(tr['ticker'])
-                    continue
-                live_price = float(hist["Close"].iloc[-1])
-                entry = tr['entry']
-                stop = tr['stop']
-                t1 = tr['t1']
-                t2 = tr['t2']
-                direction = tr['direction']
-
-                if direction == "LONG":
-                    pnl_pct = (live_price - entry) / entry * 100
-                    passed_stop = live_price <= stop
-                    passed_t1 = live_price >= t1
-                    passed_t2 = live_price >= t2
-                else:
-                    pnl_pct = (entry - live_price) / entry * 100
-                    passed_stop = live_price >= stop
-                    passed_t1 = live_price <= t1
-                    passed_t2 = live_price <= t2
-
-                # Multi-timeframe bias
-                bias_eval = get_multiframe_bias_eval(tr['ticker'], entry, direction)
-                bias_short = bias_eval.get("bias_10min", "N/A") if bias_eval else "N/A"
-                bias_long = bias_eval.get("bias_30min", "N/A") if bias_eval else "N/A"
-                alignment = bias_eval.get("alignment", "N/A") if bias_eval else "N/A"
-                tf_short = bias_eval.get("tf_short", "10m") if bias_eval else "10m"
-                tf_long = bias_eval.get("tf_long", "30m") if bias_eval else "30m"
-                align_icon = "✅" if alignment == "CONFIRMED" else ("⚠️" if alignment == "DIVERGED" else "")
-
-                # Suggested action
-                if passed_stop:
-                    action = "🔴 EXIT — Stop Hit"
-                elif passed_t2:
-                    action = "🏆 FULL PROFIT — T2"
-                elif passed_t1:
-                    action = "🎉 SCALE OUT — T1"
-                elif bias_eval and alignment == "CONFIRMED":
-                    action = "✅ HOLD — Confirmed"
-                elif bias_eval and alignment == "DIVERGED":
-                    action = "⚠️ CAUTION — Diverged"
-                elif pnl_pct >= 2.0:
-                    action = "📈 TRAIL STOP"
-                else:
-                    action = "⏳ MONITOR"
-
-                track_rows.append({
-                    "Ticker": tr['ticker'],
-                    "Direction": direction,
-                    "Scenario": tr.get("scenario", "")[:30],
-                    "Live Price": f"${live_price:.2f}",
-                    "Entry": f"${entry:.2f}",
-                    "P&L": f"{pnl_pct:+.2f}%",
-                    "Stop": f"${stop:.2f}",
-                    "T1": f"${t1:.2f}",
-                    "T2": f"${t2:.2f}",
-                    "Confidence": tr.get('confidence', 'N/A'),
-                    f"{tf_short} Bias": bias_short,
-                    f"{tf_long} Bias": bias_long,
-                    "Alignment": f"{align_icon} {alignment}",
-                    "Action": action,
-                })
-            except Exception:
-                error_tickers.append(tr['ticker'])
-
-        if track_rows:
-            track_df = pd.DataFrame(track_rows)
-            st.dataframe(track_df, use_container_width=True,
-                         height=min(40 * max(len(track_df), 1) + 38, 400))
-
-        if error_tickers:
-            st.caption(f"⚠️ Could not fetch data for: {', '.join(error_tickers)}")
-
-        # Per-row delete buttons
-        del_cols = st.columns(min(len(tracked), 8))
-        for di, tr in enumerate(tracked[:8]):
-            with del_cols[di % len(del_cols)]:
-                if st.button(f"🗑️ {tr['ticker']}", key=f"del_trk_{di}_{tr['ticker']}", use_container_width=True):
-                    st.session_state["tracking_trades"].pop(di)
-                    st.rerun()
-
-    # ── ENTRY CONFIRMATION TABLE (after 9 AM CST) ────────────────
-    if entry_confirmation_enabled and near_entry_rows:
-        st.markdown("---")
-        st.markdown("### ✅ ENTRY CONFIRMATION TABLE (9:00 AM CST+)")
-        st.markdown("Trades that **OPENED NEAR ENTRY** with **CONFIRMED BIAS** (10m & 30m aligned)")
-
-        confirmation_rows = []
-        for trade in near_entry_rows:
-            ticker = trade.get("Ticker", "?")
-            entry_price = float(trade.get("Open", "$0").replace("$", ""))
-            direction = trade.get("Direction")
-
-            bias_data = get_multiframe_bias_eval(ticker, entry_price, direction)
-
-            if bias_data and bias_data.get("alignment") == "CONFIRMED":
-                confirmation_rows.append({
-                    "Ticker": ticker,
-                    "Entry": trade.get("Open"),
-                    "Stop": trade.get("Stop"),
-                    "T1": trade.get("T1"),
-                    "T2": trade.get("T2"),
-                    "Direction": trade.get("Direction"),
-                    "Option": trade.get("Option"),
-                    "Bias Status": f"✅ {bias_data.get('alignment')} ({bias_data.get('bias_10min')})",
-                    f"{bias_data.get('tf_short', '10m')} Bias": bias_data.get("bias_10min"),
-                    f"{bias_data.get('tf_long', '30m')} Bias": bias_data.get("bias_30min"),
-                    "Current Price": f"${bias_data.get('current_price')}",
-                    "Confidence": trade.get("Confidence"),
-                    "ATR": trade.get("ATR"),
-                })
-
-        if confirmation_rows:
-            confirm_df = pd.DataFrame(confirmation_rows)
-            st.dataframe(confirm_df, use_container_width=True, height=min(40 * max(len(confirm_df), 1) + 38, 400))
-            st.success(f"🎯 {len(confirmation_rows)} trade(s) ready for entry with confirmed bias!")
-        else:
-            st.info("⏳ No trades with confirmed bias yet. Check again in a moment...")
 
 # ── Sector Scan ──────────────────────────────────────
 if sector_scan_btn:
@@ -6135,6 +8757,12 @@ if sector_scan_btn:
                 f'</div>',
                 unsafe_allow_html=True
             )
+
+            # Store swing candidates in session_state for the push button
+            _swing_setups = bullish_hot + bearish_hot
+            if _swing_setups:
+                st.session_state["_sector_swing_setups"] = _swing_setups
+                st.session_state["_sector_swing_date"] = str(date.today())
     else:
         # Fallback: scan all sector stocks without performance data
         st.warning("Could not fetch sector ETF data. Scanning all sector stocks instead...")
@@ -6247,7 +8875,78 @@ if sector_scan_btn:
             f'</div>',
             unsafe_allow_html=True
         )
-    
+
+        # Store swing candidates in session_state for the push button
+        _swing_setups = top_bullish + top_bearish
+        if _swing_setups:
+            st.session_state["_sector_swing_setups"] = _swing_setups
+            st.session_state["_sector_swing_date"] = str(date.today())
+
+
+# ── Sector Scan: Push Swing Trades to Tracker ─────────────────────────────────
+with tab_sector:
+    _sector_swings     = st.session_state.get("_sector_swing_setups", [])
+    _sector_swing_date = st.session_state.get("_sector_swing_date", "")
+    if _sector_swings:
+        st.markdown("---")
+        st.markdown(
+            f'<div style="background:#0a1628;border:1px solid #1a3a5c;padding:12px 16px;'
+            f'border-radius:8px;margin-bottom:10px">'
+            f'<span style="color:#4d9fff;font-weight:700;font-size:13px">📤 Swing Trade Push Ready</span><br>'
+            f'<span style="color:#6b7099;font-size:11px">'
+            f'{len(_sector_swings)} setup(s) from scan on {_sector_swing_date} • '
+            f'{sum(1 for r in _sector_swings if r.get("verdict")=="BULLISH")} long · '
+            f'{sum(1 for r in _sector_swings if r.get("verdict")=="BEARISH")} short'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+        push_col1, push_col2 = st.columns([2, 1])
+        with push_col1:
+            _push_selected = []
+            for r in _sector_swings:
+                label = f"{'🚀' if r.get('verdict')=='BULLISH' else '📉'} {r['ticker']} " \
+                        f"({'LONG' if r.get('verdict')=='BULLISH' else 'SHORT'}) — " \
+                        f"Score: {r.get('score', 0):+g} | {r.get('confidence','')}"
+                if st.checkbox(label, value=True, key=f"_swing_chk_{r['ticker']}"):
+                    _push_selected.append(r)
+        with push_col2:
+            if st.button(
+                f"📤 Push {len(_push_selected)} Trade(s)",
+                key="push_swing_btn",
+                type="primary",
+                use_container_width=True,
+                disabled=len(_push_selected) == 0,
+            ):
+                _saved = 0
+                for r in _push_selected:
+                    direction = "LONG" if r.get("verdict") == "BULLISH" else "SHORT"
+                    entry = r.get("entry") or r.get("price")
+                    if not entry:
+                        continue
+                    ok, _ = save_trade(
+                        ticker=r["ticker"],
+                        direction=direction,
+                        entry_price=float(entry),
+                        stop_loss=r.get("stop_loss"),
+                        target1=r.get("target1"),
+                        target2=r.get("target2"),
+                        verdict=r.get("verdict"),
+                        confidence=r.get("confidence"),
+                        score=r.get("score"),
+                        notes=f"Sector Scan {_sector_swing_date}",
+                    )
+                    if ok:
+                        _saved += 1
+                tg_sent = send_sector_swing_alert(_push_selected)
+                if _saved > 0:
+                    st.success(
+                        f"✅ {_saved} trade(s) saved to tracker!"
+                        + (" · 📱 Telegram sent" if tg_sent else "")
+                    )
+                    st.session_state["_sector_swing_setups"] = []
+                else:
+                    st.warning("⚠️ No trades saved — check entry price fields.")
+
 
 # ── Macro Dashboard ──────────────────────────────────
 with tab_macro:
@@ -6490,8 +9189,7 @@ if fetch_btn:
       hourly_df = st.session_state.fetched_data.get("hourly_df", pd.DataFrame())
     
       # Check current time in ET to determine if 4H candle is complete
-      from zoneinfo import ZoneInfo
-      now_et = datetime.now(ZoneInfo("America/New_York"))
+      now_et = datetime.now(pytz.timezone("America/New_York"))
       today = date.today()
     
       # 4H candle completes at 1:00 PM ET (13:00)
@@ -6832,18 +9530,17 @@ if fetch_btn:
       with col3:
           candle_time_cst = ""
           if candle_4h and "first_bar_ts" in candle_4h:
-              from zoneinfo import ZoneInfo
+              _cst_tz = pytz.timezone("America/Chicago")
               first_ts = candle_4h["first_bar_ts"]
               last_ts = candle_4h["last_bar_ts"]
               if hasattr(first_ts, 'tz') and first_ts.tz is not None:
-                  first_cst = first_ts.astimezone(ZoneInfo("America/Chicago"))
-                  last_cst = last_ts.astimezone(ZoneInfo("America/Chicago"))
+                  first_cst = first_ts.astimezone(_cst_tz)
+                  last_cst = last_ts.astimezone(_cst_tz)
               else:
-                  # Assume ET, convert to CST (subtract 1 hour)
-                  import pytz
+                  # Assume ET, convert to CST
                   et = pytz.timezone("America/New_York")
-                  first_cst = et.localize(first_ts.to_pydatetime()).astimezone(ZoneInfo("America/Chicago"))
-                  last_cst = et.localize(last_ts.to_pydatetime()).astimezone(ZoneInfo("America/Chicago"))
+                  first_cst = et.localize(first_ts.to_pydatetime()).astimezone(_cst_tz)
+                  last_cst = et.localize(last_ts.to_pydatetime()).astimezone(_cst_tz)
               last_cst_end = last_cst + timedelta(hours=1)  # bar timestamp is start; add 1h for candle close
               bars_count = candle_4h.get("bars", "?")
               candle_time_cst = f"{first_cst.strftime('%m/%d %I:%M %p')} – {last_cst_end.strftime('%I:%M %p')} CST ({bars_count}/4 bars)"
@@ -6927,12 +9624,16 @@ if fetch_btn:
           # ── Track Trade Button ──
           # Store trade data in session state so the save can work across reruns
           track_key = f"track_{symbol}_{_sym_idx}"
+          
+          # Capture today's open price
+          today_open = round(float(daily_df.iloc[-1]["open"]), 2) if len(daily_df) > 0 else None
+          
           _trade_payload = {
               "ticker": symbol, "direction": setup_dir, "entry_price": entry,
               "stop_loss": stop_loss, "target1": target1, "target2": target2,
               "verdict": final_verdict, "confidence": confidence, "score": score,
               "signals": ", ".join(f"{nm}: {val}" for nm, val, _, _ in signal_details),
-              "t1_days": t1_days, "t2_days": t2_days,
+              "t1_days": t1_days, "t2_days": t2_days, "open_price": today_open,
           }
           st.session_state[f"_trade_data_{track_key}"] = _trade_payload
 
@@ -6944,8 +9645,9 @@ if fetch_btn:
               payload = st.session_state.get(f"_trade_data_{tkey}")
               if payload:
                   notes = st.session_state.get(f"notes_{tkey}", "")
-                  save_trade(**payload, notes=notes if notes else None)
+                  saved, telegram_sent = save_trade(**payload, notes=notes if notes else None)
                   st.session_state[f"_trade_saved_{tkey}"] = True
+                  st.session_state[f"_telegram_sent_{tkey}"] = telegram_sent
 
           st.button(
               f"📌 Track This Trade — {setup_dir} {symbol} @ ${entry:.2f}",
@@ -6954,9 +9656,14 @@ if fetch_btn:
               args=(track_key,),
           )
           if st.session_state.get(f"_trade_saved_{track_key}"):
-              st.success(f"✅ Trade saved! {setup_dir} {symbol} @ ${entry:.2f} · "
-                        f"Stop ${stop_loss:.2f} · T1 ${target1:.2f} · T2 ${target2:.2f}")
+              telegram_sent = st.session_state.get(f"_telegram_sent_{track_key}", False)
+              msg = f"✅ Trade saved! {setup_dir} {symbol} @ ${entry:.2f} · Stop ${stop_loss:.2f} · T1 ${target1:.2f} · T2 ${target2:.2f}"
+              if telegram_sent:
+                  msg += " | 📱 Telegram sent"
+              st.success(msg)
               del st.session_state[f"_trade_saved_{track_key}"]
+              if f"_telegram_sent_{track_key}" in st.session_state:
+                  del st.session_state[f"_telegram_sent_{track_key}"]
       else:
           st.info("No directional signal — Entry/Stop/Target levels require a BULLISH or BEARISH verdict.")
 
@@ -8437,17 +11144,62 @@ with tab_trades:
                 unsafe_allow_html=True,
             )
 
-            # Close Trade controls
-            close_col1, close_col2, close_col3 = st.columns([2, 1, 1])
-            with close_col1:
+            # Action Dropdown and Close Trade controls
+            current_action = trade.get("action", "OPEN")
+            action_options = ["OPEN", "TAKE_PROFIT_T1", "TAKE_PROFIT_T2", "STOP_LOSS", "CLOSE", "DELETE"]
+            
+            action_col1, action_col2, action_col3, action_col4 = st.columns([1.5, 1, 1, 1])
+            with action_col1:
+                new_action = st.selectbox(f"Action", action_options, 
+                                         index=action_options.index(current_action) if current_action in action_options else 0,
+                                         key=f"action_{tid}")
+                if new_action != current_action:
+                    # Action changed - update and send notification
+                    exit_px_update = None
+                    if new_action == "CLOSE":
+                        close_trade(tid, entry_px)  # Close at entry if not specified
+                        exit_px_update = entry_px
+                    elif new_action in ["TAKE_PROFIT_T1", "TAKE_PROFIT_T2"]:
+                        exit_target = t1_px if new_action == "TAKE_PROFIT_T1" else t2_px
+                        if exit_target:
+                            close_trade(tid, exit_target)
+                            exit_px_update = exit_target
+                    elif new_action == "STOP_LOSS":
+                        if stop_px:
+                            close_trade(tid, stop_px)
+                            exit_px_update = stop_px
+                    elif new_action == "DELETE":
+                        delete_trade(tid)
+                        st.warning(f"Trade #{tid} {tkr} deleted")
+                        st.rerun()
+                    
+                    # Update action in database
+                    update_trade(tid, action=new_action)
+                    
+                    # Fetch fresh trade data before sending notification
+                    fresh_trade = next((t for t in get_all_trades() if t["id"] == tid), None)
+                    if fresh_trade:
+                        tele_success = send_trade_update_notification(fresh_trade, new_action, exit_px_update)
+                        status_msg = f"📱 Action updated to {new_action.replace('_', ' ')}"
+                        if tele_success:
+                            status_msg += " - Telegram sent ✅"
+                        else:
+                            status_msg += " - ⚠️ Telegram failed to send"
+                        st.success(status_msg, icon="✅")
+                    
+                    st.rerun()
+            
+            with action_col2:
                 exit_px = st.number_input(f"Exit price", min_value=0.01, value=float(entry_px),
                                           step=0.01, key=f"exit_px_{tid}")
-            with close_col2:
+            with action_col3:
                 if st.button(f"✅ Close Trade", key=f"close_{tid}"):
                     close_trade(tid, exit_px)
-                    st.success(f"Trade #{tid} {tkr} closed @ ${exit_px:.2f}")
+                    update_trade(tid, action="CLOSE")
+                    send_trade_update_notification(trade, "CLOSE", exit_px)
+                    st.success(f"Trade #{tid} {tkr} closed @ ${exit_px:.2f} | 📱 Telegram sent")
                     st.rerun()
-            with close_col3:
+            with action_col4:
                 if st.button(f"🗑️ Delete", key=f"del_{tid}"):
                     delete_trade(tid)
                     st.warning(f"Trade #{tid} deleted.")
@@ -8549,7 +11301,7 @@ with tab_trades:
     st.markdown("---")
     st.markdown("### ✏️ Add Trade Manually")
     with st.expander("Enter trade details", expanded=False):
-        m_col1, m_col2, m_col3 = st.columns(3)
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         with m_col1:
             m_ticker = st.text_input("Ticker", key="manual_ticker", placeholder="AAPL")
             m_direction = st.selectbox("Direction", ["LONG", "SHORT"], key="manual_dir")
@@ -8559,20 +11311,31 @@ with tab_trades:
         with m_col3:
             m_t1 = st.number_input("Target 1", min_value=0.0, value=0.0, step=0.01, key="manual_t1")
             m_t2 = st.number_input("Target 2", min_value=0.0, value=0.0, step=0.01, key="manual_t2")
+        with m_col4:
+            m_open = st.number_input("Open Price (optional)", min_value=0.0, value=0.0, step=0.01, key="manual_open")
         m_notes = st.text_input("Notes", key="manual_notes", placeholder="Optional notes…")
         if st.button("💾 Save Manual Trade", key="save_manual_trade"):
             if m_ticker.strip():
-                save_trade(
+                saved, telegram_sent = save_trade(
                     ticker=m_ticker.strip().upper(),
                     direction=m_direction,
                     entry_price=m_entry,
                     stop_loss=m_stop if m_stop > 0 else None,
                     target1=m_t1 if m_t1 > 0 else None,
                     target2=m_t2 if m_t2 > 0 else None,
+                    open_price=m_open if m_open > 0 else None,
                     notes=m_notes if m_notes else None,
                 )
-                st.success(f"✅ Saved {m_direction} {m_ticker.strip().upper()} @ ${m_entry:.2f}")
-                st.rerun()
+                if saved:
+                    msg = f"✅ Saved {m_direction} {m_ticker.strip().upper()} @ ${m_entry:.2f}"
+                    if telegram_sent:
+                        msg += " | 📱 Telegram notification sent"
+                    else:
+                        msg += " | ⚠️ Trade saved but Telegram notification failed"
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error("Failed to save trade")
             else:
                 st.warning("Please enter a ticker symbol.")
 

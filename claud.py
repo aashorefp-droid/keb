@@ -4973,10 +4973,10 @@ with st.sidebar:
     st.markdown("### 🔑 API Keys")
     data_source = st.radio(
         "Data Source",
-        options=["Yahoo", "Polygon"],
+        options=["Yahoo", "Polygon", "Alpaca"],
         index=0,
         horizontal=True,
-        help="Yahoo: Free real-time data via yfinance (default, no API key needed) · Polygon: Free tier has ~7 day delay on hourly bars",
+        help="Yahoo: Free real-time data via yfinance (default, no API key needed) · Polygon: Free tier has ~7 day delay on hourly bars · Alpaca: Optional API key required",
     )
     
     if data_source == "Yahoo":

@@ -38,7 +38,7 @@ Alpaca credentials and endpoints are read from environment variables. For local 
 1. Create a new **Web Service** in [Render](https://dashboard.render.com) connected to this repo.
 2. Set the build/start commands:
    - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `bash start.sh` (uses the `$PORT` Render provides)
+   - **Start Command:** `bash start.sh` (the repo already includes `start.sh`, which runs Streamlit on the `$PORT` Render provides). Alternatively, set the start command inline: `streamlit run claud.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true`
 3. Set environment variables in the Render dashboard:
    - Go to your service → **Environment** tab → **Add Environment Variable**.
    - Add the **required** vars: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_BASE_URL`.

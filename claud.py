@@ -4895,7 +4895,7 @@ with st.sidebar:
     finnhub_api_key_val = os.getenv("FINNHUB_API_KEY", "").strip()
     alpaca_api_key_val = ALPACA_API_KEY
     alpaca_api_secret_val = ALPACA_SECRET_KEY
-    polygon_key_val = ""
+    polygon_key_val = os.getenv("POLYGON_API_KEY", "").strip()
     try:
         env_path = os.path.expanduser("algorithmic-trading/.env")
         if os.path.exists(env_path):
@@ -4960,7 +4960,7 @@ with st.sidebar:
         )
         polygon_key = st.text_input(
             "Polygon Key (earnings)", type="password",
-            value=mask_key(alpaca_api_key_val) if alpaca_api_key_val else "",
+            value=mask_key(polygon_key_val) if polygon_key_val else "",
             help="Optional: for auto-detecting earnings dates via Polygon financials API",
             placeholder="optional_polygon_key",
         )
@@ -6648,7 +6648,7 @@ if check_open_run or _auto_check_open or replay_run:
                                     'APCA-API-KEY-ID': api_key,
                                     'APCA-API-SECRET-KEY': api_secret,
                                 }
-                                base_url = ALPACA_BASE_URL
+                                base_url = ALPACA_DATA_URL
                                 resp = requests.get(
                                     f"{base_url}/v1beta1/options/snapshots/{ticker}",
                                     headers=headers,

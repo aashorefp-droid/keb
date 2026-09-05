@@ -1,11 +1,11 @@
 """
-Earnings Backtest — Alpaca/Polygon Edition
+Earnings Backtest — Yahoo Finance Edition
 Strategy: Enter on earnings report day (AMC) at ~1:30 PM ET (12:30 PM CST)
           using the 9:30–1:30 ET 4H candle direction.
           Exit: next trading day close.
 Data Sources:
-  - Alpaca: Free real-time OHLCV bars (recommended)
-  - Polygon: Free tier has ~7 day delay on hourly bars
+  - Yahoo Finance: Free real-time & historical market data via yfinance (default)
+  - Polygon: Free tier has ~7 day delay on hourly bars (optional)
 """
 
 import sys
@@ -36,7 +36,7 @@ except ImportError:
     print("⚠️ apscheduler not installed. Run: pip install apscheduler")
 
 # ──────────────────────────────────────────────
-# ENVIRONMENT / ALPACA CONFIGURATION
+# ENVIRONMENT CONFIGURATION
 # ──────────────────────────────────────────────
 # Load .env for local development only (Render injects env vars directly).
 try:
@@ -45,11 +45,9 @@ try:
 except ImportError:
     pass  # python-dotenv not installed (e.g. minimal deploy) — env vars come from the OS
 
-# Alpaca credentials & endpoints (see .env.example for documentation).
-# Set these in the Render dashboard (Environment tab) or a local .env file.
+# Optional Alpaca credentials & endpoints (for optional fallback).
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
-# Paper: https://paper-api.alpaca.markets · Live: https://api.alpaca.markets
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
 ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").strip()
 
@@ -1362,6 +1360,28 @@ def get_hourly_bars_alpaca(ticker, start_date, end_date, api_key, api_secret):
     df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
     df = df.set_index("dt_et")[["open", "high", "low", "close", "volume"]]
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_daily_bars_yfinance(ticker, start_date, end_date):
+    """Daily adjusted OHLCV from Yahoo Finance via yfinance (free, no API key needed)."""
+    if not YFINANCE_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        tk = yf.Ticker(ticker)
+        s = pd.to_datetime(start_date)
+        e = pd.to_datetime(end_date) + timedelta(days=1)
+        df = tk.history(start=s, end=e, interval="1d", auto_adjust=True)
+        if df.empty:
+            return pd.DataFrame()
+        df.columns = [c.lower() for c in df.columns]
+        df["date"] = pd.to_datetime(df.index).date
+        df = df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"})
+        cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        df = df.set_index("date")[cols]
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -3376,10 +3396,17 @@ def get_sector_performance(api_key, api_secret, data_source):
     for etf, info in SECTOR_ETFS.items():
         try:
             # Fetch daily data for sector ETF
-            if data_source == "Alpaca":
+            if data_source == "Yahoo":
+                df = get_daily_bars_yfinance(etf, str(start_date), str(end_date))
+            elif data_source == "Alpaca":
                 df = get_daily_bars_alpaca(etf, str(start_date), str(end_date), api_key, api_secret)
-            else:
+            elif data_source == "Polygon":
                 df = get_daily_bars(etf, str(start_date), str(end_date), api_key)
+            else:
+                df = get_daily_bars_yfinance(etf, str(start_date), str(end_date))
+
+            if (df is None or df.empty or len(df) < 5) and YFINANCE_AVAILABLE:
+                df = get_daily_bars_yfinance(etf, str(start_date), str(end_date))
             
             if df.empty or len(df) < 5:
                 continue
@@ -3831,24 +3858,30 @@ def scan_single_stock(ticker, api_key, api_secret, data_source, use_fib=True, fi
         start_date = end_date - timedelta(days=365)  # 1 year for Fib levels
         
         # Fetch daily data
-        if data_source == "Alpaca":
+        if data_source == "Yahoo":
+            daily_df = get_daily_bars_yfinance(ticker, str(start_date), str(end_date))
+        elif data_source == "Alpaca":
             daily_df = get_daily_bars_alpaca(ticker, str(start_date), str(end_date), api_key, api_secret)
-        else:
+        elif data_source == "Polygon":
             daily_df = get_daily_bars(ticker, str(start_date), str(end_date), api_key)
+        else:
+            daily_df = get_daily_bars_yfinance(ticker, str(start_date), str(end_date))
 
         # Fallback to yfinance if primary source returned no data
         if (daily_df is None or daily_df.empty or len(daily_df) < 20) and YFINANCE_AVAILABLE:
-            try:
-                import yfinance as yf
-                _yf = yf.Ticker(ticker)
-                _yf_hist = _yf.history(period="1y", auto_adjust=True)
-                if _yf_hist is not None and not _yf_hist.empty and len(_yf_hist) >= 20:
-                    daily_df = _yf_hist.rename(columns={
-                        "Open": "open", "High": "high", "Low": "low",
-                        "Close": "close", "Volume": "volume"
-                    })[["open", "high", "low", "close", "volume"]]
-            except Exception:
-                pass
+            daily_df = get_daily_bars_yfinance(ticker, str(start_date), str(end_date))
+            if daily_df is None or daily_df.empty or len(daily_df) < 20:
+                try:
+                    import yfinance as yf
+                    _yf = yf.Ticker(ticker)
+                    _yf_hist = _yf.history(period="1y", auto_adjust=True)
+                    if _yf_hist is not None and not _yf_hist.empty and len(_yf_hist) >= 20:
+                        daily_df = _yf_hist.rename(columns={
+                            "Open": "open", "High": "high", "Low": "low",
+                            "Close": "close", "Volume": "volume"
+                        })[["open", "high", "low", "close", "volume"]]
+                except Exception:
+                    pass
 
         if daily_df is None or daily_df.empty or len(daily_df) < 20:
             return None
@@ -4940,26 +4973,35 @@ with st.sidebar:
     st.markdown("### 🔑 API Keys")
     data_source = st.radio(
         "Data Source",
-        options=["Alpaca", "Polygon"],
+        options=["Yahoo", "Polygon"],
         index=0,
         horizontal=True,
-        help="Alpaca: Free real-time data · Polygon: Free tier has ~7 day delay on hourly bars",
+        help="Yahoo: Free real-time data via yfinance (default, no API key needed) · Polygon: Free tier has ~7 day delay on hourly bars",
     )
     
-    if data_source == "Alpaca":
+    if data_source == "Yahoo":
+        api_key = None
+        api_secret = None
+        polygon_key = st.text_input(
+            "Polygon Key (earnings, optional)", type="password",
+            value=mask_key(polygon_key_val) if polygon_key_val else "",
+            help="Optional: for auto-detecting earnings dates via Polygon financials API",
+            placeholder="optional_polygon_key",
+        )
+    elif data_source == "Alpaca":
         api_key = st.text_input(
-            "Alpaca API Key", type="password",
+            "Alpaca API Key (optional)", type="password",
             value=mask_key(alpaca_api_key_val) if alpaca_api_key_val else "",
             help="Get free keys at alpaca.markets",
             placeholder="your_alpaca_api_key",
         )
         api_secret = st.text_input(
-            "Alpaca Secret Key", type="password",
+            "Alpaca Secret Key (optional)", type="password",
             value=mask_key(alpaca_api_secret_val) if alpaca_api_secret_val else "",
             placeholder="your_alpaca_secret_key",
         )
         polygon_key = st.text_input(
-            "Polygon Key (earnings)", type="password",
+            "Polygon Key (earnings, optional)", type="password",
             value=mask_key(polygon_key_val) if polygon_key_val else "",
             help="Optional: for auto-detecting earnings dates via Polygon financials API",
             placeholder="optional_polygon_key",
@@ -4967,6 +5009,7 @@ with st.sidebar:
     else:
         api_key = st.text_input(
             "Polygon API Key", type="password",
+            value=mask_key(polygon_key_val) if polygon_key_val else "",
             help="Get a free key at polygon.io",
             placeholder="your_polygon_api_key",
         )
@@ -5047,8 +5090,11 @@ with st.sidebar:
                     st.write(f"  • {t['ticker']} {t['direction']} · P&L: {t.get('pnl_pct', 0):+.2f}%")
 
 
-# ── Credential check (fail fast) ─────────────────────
-if data_source == "Alpaca":
+# ── Credential check (optional for default Yahoo Finance source) ─────────────────────
+if data_source == "Polygon":
+    missing_creds = not api_key
+    alpaca_env_missing = []
+elif data_source == "Alpaca":
     missing_creds = not api_key or not api_secret
     alpaca_env_missing = [
         name for name, val in (
@@ -5058,15 +5104,14 @@ if data_source == "Alpaca":
         if not val
     ]
 else:
-    missing_creds = not api_key
+    missing_creds = False
     alpaca_env_missing = []
 
 if missing_creds and alpaca_env_missing:
     st.warning(
-        "⚠️ Missing required Alpaca environment variable(s): "
+        "⚠️ Missing optional Alpaca environment variable(s): "
         + ", ".join(f"`{name}`" for name in alpaca_env_missing)
-        + ". Set them in the Render dashboard (Environment tab) or a local `.env` file "
-          "(see `.env.example`), or enter credentials in the sidebar.",
+        + ". Enter credentials in the sidebar or switch to Yahoo (default).",
         icon="🔑",
     )
 
@@ -5077,9 +5122,8 @@ if missing_creds:
         '<div style="color:#6b7099;font-size:16px;margin-bottom:8px;font-weight:600">'
         'Welcome to StockPulse</div>'
         '<div style="color:#3a3d5c;font-size:11px;line-height:2">'
-        'Enter your API credentials in the sidebar to get started.<br>'
-        '<b>Alpaca</b>: Free real-time data at '
-        '<a href="https://alpaca.markets" style="color:#00e5a0">alpaca.markets</a><br>'
+        'Enter your API credentials in the sidebar to get started, or select <b>Yahoo</b> (no credentials required).<br>'
+        '<b>Yahoo</b>: Free data via yfinance<br>'
         '<b>Polygon</b>: Free tier at '
         '<a href="https://polygon.io" style="color:#4d9fff">polygon.io</a>'
         '</div></div>',
@@ -5948,10 +5992,17 @@ if bt_run:
             bt_end = date.today()
             bt_start = bt_end - timedelta(days=bt_years * 365)
             try:
-                if data_source == "Alpaca":
+                if data_source == "Yahoo":
+                    bt_daily = get_daily_bars_yfinance(bt_ticker, str(bt_start), str(bt_end))
+                elif data_source == "Alpaca":
                     bt_daily = get_daily_bars_alpaca(bt_ticker, str(bt_start), str(bt_end), api_key, api_secret)
-                else:
+                elif data_source == "Polygon":
                     bt_daily = get_daily_bars(bt_ticker, str(bt_start), str(bt_end), api_key)
+                else:
+                    bt_daily = get_daily_bars_yfinance(bt_ticker, str(bt_start), str(bt_end))
+
+                if (bt_daily is None or bt_daily.empty) and YFINANCE_AVAILABLE:
+                    bt_daily = get_daily_bars_yfinance(bt_ticker, str(bt_start), str(bt_end))
 
                 if bt_daily is None or bt_daily.empty or len(bt_daily) < 80:
                     st.warning(f"Not enough data for {bt_ticker} ({len(bt_daily) if bt_daily is not None else 0} bars).")
@@ -6111,10 +6162,17 @@ if dl_run:
             try:
                 # Fetch enough data before the lookup date for indicators
                 lookup_start = dl_date - timedelta(days=400)
-                if data_source == "Alpaca":
+                if data_source == "Yahoo":
+                    dl_daily = get_daily_bars_yfinance(dl_ticker, str(lookup_start), str(dl_date))
+                elif data_source == "Alpaca":
                     dl_daily = get_daily_bars_alpaca(dl_ticker, str(lookup_start), str(dl_date), api_key, api_secret)
-                else:
+                elif data_source == "Polygon":
                     dl_daily = get_daily_bars(dl_ticker, str(lookup_start), str(dl_date), api_key)
+                else:
+                    dl_daily = get_daily_bars_yfinance(dl_ticker, str(lookup_start), str(dl_date))
+
+                if (dl_daily is None or dl_daily.empty) and YFINANCE_AVAILABLE:
+                    dl_daily = get_daily_bars_yfinance(dl_ticker, str(lookup_start), str(dl_date))
 
                 if dl_daily is None or dl_daily.empty or len(dl_daily) < 60:
                     st.warning(f"Not enough data for {dl_ticker} up to {dl_date} ({len(dl_daily) if dl_daily is not None else 0} bars).")
@@ -6225,10 +6283,17 @@ if check_open_run or _auto_check_open or replay_run:
                 try:
                     p_end = _prev
                     p_start = p_end - timedelta(days=400)
-                    if data_source == "Alpaca":
+                    if data_source == "Yahoo":
+                        p_daily = get_daily_bars_yfinance(_aticker, str(p_start), str(p_end))
+                    elif data_source == "Alpaca":
                         p_daily = get_daily_bars_alpaca(_aticker, str(p_start), str(p_end), api_key, api_secret)
-                    else:
+                    elif data_source == "Polygon":
                         p_daily = get_daily_bars(_aticker, str(p_start), str(p_end), api_key)
+                    else:
+                        p_daily = get_daily_bars_yfinance(_aticker, str(p_start), str(p_end))
+
+                    if (p_daily is None or p_daily.empty) and YFINANCE_AVAILABLE:
+                        p_daily = get_daily_bars_yfinance(_aticker, str(p_start), str(p_end))
                     if p_daily is None or p_daily.empty or len(p_daily) < 60:
                         continue
                     daily_close = float(p_daily["close"].iloc[-1])
@@ -6354,10 +6419,17 @@ if check_open_run or _auto_check_open or replay_run:
                 try:
                     p_end = _prev
                     p_start = p_end - timedelta(days=400)
-                    if data_source == "Alpaca":
+                    if data_source == "Yahoo":
+                        p_daily = get_daily_bars_yfinance(_aticker, str(p_start), str(p_end))
+                    elif data_source == "Alpaca":
                         p_daily = get_daily_bars_alpaca(_aticker, str(p_start), str(p_end), api_key, api_secret)
-                    else:
+                    elif data_source == "Polygon":
                         p_daily = get_daily_bars(_aticker, str(p_start), str(p_end), api_key)
+                    else:
+                        p_daily = get_daily_bars_yfinance(_aticker, str(p_start), str(p_end))
+
+                    if (p_daily is None or p_daily.empty) and YFINANCE_AVAILABLE:
+                        p_daily = get_daily_bars_yfinance(_aticker, str(p_start), str(p_end))
                     if p_daily is None or p_daily.empty or len(p_daily) < 60:
                         continue
                     daily_close = float(p_daily["close"].iloc[-1])
@@ -8209,10 +8281,17 @@ if plan_run:
                 try:
                     p_end = plan_date
                     p_start = p_end - timedelta(days=400)
-                    if data_source == "Alpaca":
+                    if data_source == "Yahoo":
+                        p_daily = get_daily_bars_yfinance(ticker, str(p_start), str(p_end))
+                    elif data_source == "Alpaca":
                         p_daily = get_daily_bars_alpaca(ticker, str(p_start), str(p_end), api_key, api_secret)
-                    else:
+                    elif data_source == "Polygon":
                         p_daily = get_daily_bars(ticker, str(p_start), str(p_end), api_key)
+                    else:
+                        p_daily = get_daily_bars_yfinance(ticker, str(p_start), str(p_end))
+
+                    if (p_daily is None or p_daily.empty) and YFINANCE_AVAILABLE:
+                        p_daily = get_daily_bars_yfinance(ticker, str(p_start), str(p_end))
 
                     if p_daily is None or p_daily.empty or len(p_daily) < 60:
                         continue
@@ -9028,7 +9107,7 @@ start_date = end_date - timedelta(days=365 * years + 60)
 
 if fetch_btn:
   with tab_fetch:
-    source_name = "Alpaca" if data_source == "Alpaca" else "Polygon"
+    source_name = "Yahoo Finance" if data_source == "Yahoo" else ("Alpaca" if data_source == "Alpaca" else "Polygon")
     for _sym_idx, symbol in enumerate(symbols_list):
       st.markdown(f"---\n### 📊 {symbol}" if _sym_idx > 0 else "")
       with st.spinner(f"Fetching {symbol} data from {source_name}…"):
@@ -9036,10 +9115,17 @@ if fetch_btn:
 
         status.info(f"📈 Fetching daily price bars for {symbol}…")
         try:
-            if data_source == "Alpaca":
+            if data_source == "Yahoo":
+                daily_df = get_daily_bars_yfinance(symbol, str(start_date - timedelta(days=90)), str(end_date))
+            elif data_source == "Alpaca":
                 daily_df = get_daily_bars_alpaca(symbol, str(start_date - timedelta(days=90)), str(end_date), api_key, api_secret)
-            else:
+            elif data_source == "Polygon":
                 daily_df = get_daily_bars(symbol, str(start_date - timedelta(days=90)), str(end_date), api_key)
+            else:
+                daily_df = get_daily_bars_yfinance(symbol, str(start_date - timedelta(days=90)), str(end_date))
+
+            if (daily_df is None or daily_df.empty) and YFINANCE_AVAILABLE:
+                daily_df = get_daily_bars_yfinance(symbol, str(start_date - timedelta(days=90)), str(end_date))
         except Exception as e:
             status.empty()
             st.error(f"**{source_name} API Error**\n\n{e}")
@@ -9071,8 +9157,8 @@ if fetch_btn:
             continue
 
         status.info("📅 Resolving earnings dates…")
-        # Use Polygon key for earnings dates (even when using Alpaca for price data)
-        earnings_key = polygon_key if data_source == "Alpaca" else api_key
+        # Use Polygon key for earnings dates if available
+        earnings_key = polygon_key if polygon_key else api_key
         earnings_events, earn_source = get_earnings_dates(
             symbol, earnings_key,
             limit=years * 5 + 4,
@@ -10480,10 +10566,14 @@ if False:  # Earnings Analysis backtest commented out — use the Backtest tab i
     if use_4h:
         status.info("⏱ Fetching hourly bars for 4H candle analysis…")
         try:
-            if data_source == "Alpaca":
-                hourly_df = get_hourly_bars_alpaca(symbol, str(hourly_start), str(end_date), api_key, api_secret)
-            else:
-                hourly_df = get_hourly_bars(symbol, str(hourly_start), str(end_date), api_key)
+            hourly_df = pd.DataFrame()
+            if YFINANCE_AVAILABLE:
+                hourly_df = get_hourly_bars_yfinance(symbol, str(hourly_start), str(end_date))
+            if hourly_df is None or hourly_df.empty:
+                if data_source == "Alpaca":
+                    hourly_df = get_hourly_bars_alpaca(symbol, str(hourly_start), str(end_date), api_key, api_secret)
+                elif data_source == "Polygon":
+                    hourly_df = get_hourly_bars(symbol, str(hourly_start), str(end_date), api_key)
             if hourly_df.empty:
                 st.sidebar.warning("⚠️ No hourly data returned — 4H candle will fall back to daily open/close.")
         except Exception as e:

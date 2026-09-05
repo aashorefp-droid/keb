@@ -36,6 +36,25 @@ except ImportError:
     print("⚠️ apscheduler not installed. Run: pip install apscheduler")
 
 # ──────────────────────────────────────────────
+# ENVIRONMENT / ALPACA CONFIGURATION
+# ──────────────────────────────────────────────
+# Load .env for local development only (Render injects env vars directly).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed (e.g. minimal deploy) — env vars come from the OS
+
+# Alpaca credentials & endpoints (see .env.example for documentation).
+# Set these in the Render dashboard (Environment tab) or a local .env file.
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
+# Paper: https://paper-api.alpaca.markets · Live: https://api.alpaca.markets
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").strip()
+ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets").strip()
+
+
+# ──────────────────────────────────────────────
 # TELEGRAM NOTIFICATION SETUP
 # ──────────────────────────────────────────────
 # Set your Telegram bot token and chat ID here
@@ -1245,7 +1264,7 @@ def get_hourly_bars(ticker, start_date, end_date, api_key):
 # ALPACA API HELPERS
 # ──────────────────────────────────────────────
 
-ALPACA_DATA_BASE = "https://data.alpaca.markets"
+ALPACA_DATA_BASE = ALPACA_DATA_URL
 
 def alpaca_get(endpoint, params, api_key, api_secret):
     """Generic Alpaca GET with authentication headers."""
@@ -4872,22 +4891,21 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    # Auto-populate keys from files if available
-    import os
-    finnhub_api_key_val = ""
-    alpaca_api_key_val = ""
-    alpaca_api_secret_val = ""
+    # Auto-populate keys from environment variables first (Render), then files if available
+    finnhub_api_key_val = os.getenv("FINNHUB_API_KEY", "").strip()
+    alpaca_api_key_val = ALPACA_API_KEY
+    alpaca_api_secret_val = ALPACA_SECRET_KEY
     polygon_key_val = ""
     try:
         env_path = os.path.expanduser("algorithmic-trading/.env")
         if os.path.exists(env_path):
             with open(env_path, "r") as f:
                 for line in f:
-                    if "ALPACA_API_KEY" in line:
+                    if not alpaca_api_key_val and "ALPACA_API_KEY" in line:
                         alpaca_api_key_val = line.split("=")[1].strip().strip('"')
-                    if "ALPACA_API_SECRET" in line:
+                    if not alpaca_api_secret_val and "ALPACA_API_SECRET" in line:
                         alpaca_api_secret_val = line.split("=")[1].strip().strip('"')
-                    if "FINNHUB_API_KEY" in line:
+                    if not finnhub_api_key_val and "FINNHUB_API_KEY" in line:
                         finnhub_api_key_val = line.split("=")[1].strip().strip('"')
     except Exception:
         pass
@@ -4901,16 +4919,16 @@ with st.sidebar:
                     if isinstance(node, ast.Assign):
                         for target in node.targets:
                             if hasattr(target, 'id'):
-                                if target.id == "API_KEY":
+                                if target.id == "API_KEY" and not alpaca_api_key_val:
                                     alpaca_api_key_val = node.value.s
-                                if target.id == "API_SECRET":
+                                if target.id == "API_SECRET" and not alpaca_api_secret_val:
                                     alpaca_api_secret_val = node.value.s
                     if isinstance(node, ast.Assign) and hasattr(node.value, 'keys'):
                         for k, v in zip(node.value.keys, node.value.values):
                             if hasattr(k, 's') and hasattr(v, 's'):
-                                if k.s == "API_KEY":
+                                if k.s == "API_KEY" and not alpaca_api_key_val:
                                     alpaca_api_key_val = v.s
-                                if k.s == "API_SECRET":
+                                if k.s == "API_SECRET" and not alpaca_api_secret_val:
                                     alpaca_api_secret_val = v.s
     except Exception:
         pass
@@ -5029,11 +5047,28 @@ with st.sidebar:
                     st.write(f"  • {t['ticker']} {t['direction']} · P&L: {t.get('pnl_pct', 0):+.2f}%")
 
 
-# ── Credential check ─────────────────────────────────
+# ── Credential check (fail fast) ─────────────────────
 if data_source == "Alpaca":
     missing_creds = not api_key or not api_secret
+    alpaca_env_missing = [
+        name for name, val in (
+            ("ALPACA_API_KEY", ALPACA_API_KEY),
+            ("ALPACA_SECRET_KEY", ALPACA_SECRET_KEY),
+        )
+        if not val
+    ]
 else:
     missing_creds = not api_key
+    alpaca_env_missing = []
+
+if missing_creds and alpaca_env_missing:
+    st.warning(
+        "⚠️ Missing required Alpaca environment variable(s): "
+        + ", ".join(f"`{name}`" for name in alpaca_env_missing)
+        + ". Set them in the Render dashboard (Environment tab) or a local `.env` file "
+          "(see `.env.example`), or enter credentials in the sidebar.",
+        icon="🔑",
+    )
 
 if missing_creds:
     st.markdown(
@@ -6613,7 +6648,7 @@ if check_open_run or _auto_check_open or replay_run:
                                     'APCA-API-KEY-ID': api_key,
                                     'APCA-API-SECRET-KEY': api_secret,
                                 }
-                                base_url = "https://api.alpaca.markets"
+                                base_url = ALPACA_BASE_URL
                                 resp = requests.get(
                                     f"{base_url}/v1beta1/options/snapshots/{ticker}",
                                     headers=headers,

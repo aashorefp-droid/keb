@@ -25,3 +25,6 @@ Thumbs.db
 # Env files
 .env
 *.env
+
+# Runtime database
+stockpulse_trades.db
